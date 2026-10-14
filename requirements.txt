@@ -1,0 +1,7 @@
+# Zero-Additional-Cost Open Source Dependencies
+psycopg[binary]>=3.2.0
+slack-bolt>=1.21.0
+APScheduler>=3.10.4
+streamlit>=1.40.0
+boto3>=1.35.0
+msal>=1.31.0

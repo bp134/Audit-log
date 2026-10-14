@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  # 1. Slack Socket Mode Task Bot & Tranche Scheduler (Morning / Mid-Day / End-of-Day)
+  slack-compliance-bot:
+    build: .
+    container_name: pharmacy_slack_compliance_bot
+    restart: unless-stopped
+    env_file: .env
+    command: python -m src.slack_bot.service
+    volumes:
+      - compliance_data:/app/data
+
+  # 2. Entra ID Compliance & GPhC Inspection Dashboard (Streamlit UI)
+  compliance-dashboard:
+    build: .
+    container_name: pharmacy_compliance_dashboard
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8501:8501"
+    command: streamlit run src/dashboard/app.py --server.port=8501 --server.address=0.0.0.0
+    volumes:
+      - compliance_data:/app/data
+
+  # 3. Nightly Encrypted Hetzner S3 Archival & Automated "Break-Glass" Restore Verifier
+  backup-break-glass-verifier:
+    build: .
+    container_name: pharmacy_backup_verifier
+    restart: unless-stopped
+    env_file: .env
+    command: python -m src.backup.service
+    volumes:
+      - compliance_data:/app/data
+      - s3_staging_vault:/app/s3_vault
+
+volumes:
+  compliance_data:
+  s3_staging_vault:
