@@ -5,9 +5,21 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+FORBIDDEN_PLACEHOLDERS = frozenset(
+    {
+        "changeme",
+        "xoxb-placeholder",
+        "xapp-placeholder",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    }
+)
+
 
 @dataclass(frozen=True)
 class AppConfig:
+    # Execution environment ("development" vs "production")
+    environment: str = field(default_factory=lambda: os.getenv("ENV", "development").lower())
+
     # Database (Azure PostgreSQL Flexible Server in production)
     database_url: str = field(
         default_factory=lambda: os.getenv(
@@ -55,3 +67,22 @@ class AppConfig:
             "BACKUP_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         )
     )
+
+    def __post_init__(self) -> None:
+        if self.environment != "development":
+            self.validate_production_secrets()
+
+    def validate_production_secrets(self) -> None:
+        """ID-005: Fail fast if required secrets are missing or use known placeholders."""
+        if not self.database_url or "changeme" in self.database_url:
+            raise RuntimeError("ID-005 Violation: DATABASE_URL is missing or contains default password.")
+        if not self.slack_bot_token or self.slack_bot_token in FORBIDDEN_PLACEHOLDERS:
+            raise RuntimeError("ID-005 Violation: SLACK_BOT_TOKEN is missing or placeholder.")
+        if not self.slack_app_token or self.slack_app_token in FORBIDDEN_PLACEHOLDERS:
+            raise RuntimeError("ID-005 Violation: SLACK_APP_TOKEN is missing or placeholder.")
+        if (
+            not self.backup_encryption_key
+            or self.backup_encryption_key in FORBIDDEN_PLACEHOLDERS
+            or len(self.backup_encryption_key) < 64
+        ):
+            raise RuntimeError("ID-005 Violation: BACKUP_ENCRYPTION_KEY is missing, weak, or default hex.")

@@ -1,0 +1,17 @@
+# Environment & Secrets (ID-006)
+.env
+.env.*
+!.env.example
+
+# Local Databases & Backup Vaults
+*.db
+*.db-journal
+*.db-wal
+s3_vault/
+
+# Supervisor Worktrees & Runtime Artifacts
+worktrees/
+evidence/
+__pycache__/
+.pytest_cache/
+.venv/

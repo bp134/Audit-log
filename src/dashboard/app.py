@@ -38,8 +38,8 @@ def render_streamlit_dashboard() -> None:
     repo = ComplianceRepository(cfg.sqlite_fallback_path)
     repo.seed_tasks_from_sql_file()
 
-    # Ensure default demo staff profiles exist for immediate interactive preview
-    if not repo.list_users():
+    # ID-021: Gate demo staff seeding strictly behind ENV=development
+    if cfg.environment == "development" and not repo.list_users():
         repo.upsert_user(
             entra_oid="entra-pharm-anjum",
             slack_user_id="U_PHARM_ANJUM",
