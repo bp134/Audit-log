@@ -1,0 +1,50 @@
+{
+  "version": "1.0.0",
+  "all_audit_ids": [
+    "ID-005",
+    "ID-006",
+    "ID-020",
+    "ID-021"
+  ],
+  "waived_audit_ids": {},
+  "work_packages": [
+    {
+      "task_id": "WP-1",
+      "title": "Secret Hygiene, .gitignore, Pinned Dependencies & Demo Seed Guard",
+      "audit_ids": [
+        "ID-005",
+        "ID-006",
+        "ID-020",
+        "ID-021"
+      ],
+      "critical": true,
+      "allow_waiver": false,
+      "max_changed_lines": 250,
+      "allowed_paths": [
+        ".gitignore",
+        "requirements.txt",
+        "src/config.py",
+        "src/dashboard/app.py",
+        "tests/test_wp1_secrets_and_hygiene.py"
+      ],
+      "forbidden_paths": [
+        "supervisor.py",
+        "verify_audit_log.py",
+        "remediation_plan.json",
+        "gates.json",
+        "db/**"
+      ],
+      "required_tests": [
+        "tests/test_wp1_secrets_and_hygiene.py",
+        "tests/test_phase1_schema_and_immutability.py",
+        "tests/test_phase4_backup_and_break_glass.py"
+      ],
+      "acceptance_criteria": [
+        "ID-005: AppConfig.validate_production_secrets() raises RuntimeError when ENV=production and secrets are missing or match known placeholders",
+        "ID-006: .gitignore exists and excludes .env, *.db, s3_vault/, worktrees/, evidence/, and __pycache__/",
+        "ID-020: requirements.txt pins exact == versions for all dependencies",
+        "ID-021: src/dashboard/app.py only seeds demo users when cfg.environment == 'development'"
+      ]
+    }
+  ]
+}

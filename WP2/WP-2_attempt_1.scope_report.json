@@ -1,0 +1,21 @@
+{
+  "task_id": "WP-2",
+  "attempt": 1,
+  "passed": true,
+  "total_changed_lines": 884,
+  "max_changed_lines": 1800,
+  "touched_files": [
+    ".env.example",
+    "db/01_schema.sql",
+    "src/backup/archive_and_verify.py",
+    "src/backup/service.py",
+    "src/config.py",
+    "src/dashboard/app.py",
+    "src/domain/ledger.py",
+    "src/repository/db_repo.py",
+    "src/slack_bot/service.py",
+    "tests/test_phase1_schema_and_immutability.py",
+    "tests/test_wp2_hash_chain_and_db_integrity.py"
+  ],
+  "violations": []
+}

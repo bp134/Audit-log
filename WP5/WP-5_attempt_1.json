@@ -1,0 +1,35 @@
+{
+  "packet_id": "WP-5_attempt_1",
+  "task_id": "WP-5",
+  "audit_ids": [
+    "ID-003",
+    "ID-013",
+    "ID-014",
+    "ID-023",
+    "ID-025"
+  ],
+  "attempt": 1,
+  "timestamp_utc": "2026-10-16T18:33:38.297775+00:00",
+  "git_base_ref": "11dc9618f74cd1e64a44ea2e26938e1e774cb81d",
+  "file_hashes_sha256": {
+    "src/backup/archive_and_verify.py": "d3e964a9032ac82d4752c982130d34a391e74662b55992d83dfc12c64c9413de",
+    "src/backup/service.py": "886ad5225e1d8017a3c104e0ce1de5d9206fe9bfb53632ce5102d1fa08d86415",
+    "tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py": "7a9e798d4fc39dd678f1d9580a787a57add659fd435875b9fa3c8845d2867aae"
+  },
+  "patch_sha256": "426f60e64ea9369ed23e4a9c9a0268d4d78d2e35eeb52673822b91e99be83f7b",
+  "gate_exit_codes": {
+    "ruff": 0,
+    "pytest_suite": 0,
+    "bandit": 0,
+    "pip_audit": 0,
+    "secret_scanner_gate": 0
+  },
+  "acceptance_exit_codes": {
+    "tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py": 0,
+    "tests/test_phase4_backup_and_break_glass.py": 0,
+    "tests/test_phase5_end_to_end_workflow.py": 0
+  },
+  "critic_attestation_valid": true,
+  "critic_advisory_findings": [],
+  "packet_sha256": "770e6609f21544967ea55bce96af361151248f6264759df1e6581335186edb94"
+}

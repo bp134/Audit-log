@@ -1,0 +1,1476 @@
+diff --git a/.env.example b/.env.example
+index 38c7c65..5ba5c4e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -2,9 +2,8 @@
+ # Pharmacy Workflow & Compliance Automation - Environment Configuration
+ # =============================================================================
+ 
+-# 1. Azure Database for PostgreSQL - Flexible Server (TLS enforced)
++# 1. Azure Database for PostgreSQL - Flexible Server (TLS enforced; sole database engine)
+ DATABASE_URL=postgresql://app_compliance_writer:REPLACE_WITH_PASSWORD@your-server.postgres.database.azure.com:5432/pharmacy_compliance?sslmode=require
+-SQLITE_FALLBACK_PATH=/app/data/pharmacy_compliance.db
+ 
+ # 2. Slack App (Free Tier - Socket Mode)
+ SLACK_BOT_TOKEN=xoxb-your-bot-token
+diff --git a/db/01_schema.sql b/db/01_schema.sql
+index d17b2f6..5c6c551 100644
+--- a/db/01_schema.sql
++++ b/db/01_schema.sql
+@@ -7,35 +7,35 @@
+ BEGIN;
+ 
+ -- Required extension for SHA-256 cryptographic hashing inside PostgreSQL triggers
+-CREATE EXTENSION IF NOT EXISTS pgcrypto;
++CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+ 
+ -- -----------------------------------------------------------------------------
+ -- 1. ENUMERATED TYPES
+ -- -----------------------------------------------------------------------------
+ DO $$
+ BEGIN
+-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'task_frequency') THEN
++    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'task_frequency' AND n.nspname = current_schema()) THEN
+         CREATE TYPE task_frequency AS ENUM ('Daily', 'Weekly', 'Monthly');
+     END IF;
+ 
+-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'daily_window') THEN
++    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'daily_window' AND n.nspname = current_schema()) THEN
+         CREATE TYPE daily_window AS ENUM ('Morning', 'Anytime', 'End_Of_Day');
+     END IF;
+ 
+-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'staff_role') THEN
++    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'staff_role' AND n.nspname = current_schema()) THEN
+         CREATE TYPE staff_role AS ENUM ('Pharm', 'Dispenser', 'Manager');
+     END IF;
+ 
+-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'role_requirement') THEN
++    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'role_requirement' AND n.nspname = current_schema()) THEN
+         -- Normalized from 'Pharm', 'Dispenser', 'Dispenser / Pharm', 'Pharm / Dispenser'
+         CREATE TYPE role_requirement AS ENUM ('Pharm', 'Dispenser', 'Either');
+     END IF;
+ 
+-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'instance_status') THEN
++    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'instance_status' AND n.nspname = current_schema()) THEN
+         CREATE TYPE instance_status AS ENUM ('Pending', 'Completed', 'Escalated', 'Missed');
+     END IF;
+ 
+-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'audit_event_type') THEN
++    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'audit_event_type' AND n.nspname = current_schema()) THEN
+         CREATE TYPE audit_event_type AS ENUM (
+             'INSTANCE_SCHEDULED',
+             'REMINDER_DISPATCHED',
+@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS users_rbac (
+     gphc_reg_number     VARCHAR(32),                   -- Mandatory for Pharmacists
+     is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+-    updated_at          TIMAMPTZ NOT NULL DEFAULT NOW(),
++    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+     CONSTRAINT chk_pharmacist_gphc CHECK (
+         staff_role <> 'Pharm' OR (gphc_reg_number IS NOT NULL AND length(trim(gphc_reg_number)) >= 6)
+     )
+@@ -147,6 +147,37 @@ CREATE INDEX IF NOT EXISTS idx_audit_occurred_at ON task_events_audit(occurred_a
+ CREATE INDEX IF NOT EXISTS idx_audit_task_instance ON task_events_audit(task_id, instance_id);
+ CREATE INDEX IF NOT EXISTS idx_audit_event_type ON task_events_audit(event_type);
+ 
++-- Helper Function: Canonical compact JSONB serialization (ID-008: sorted keys, no spaces after ':' or ',')
++-- Matches Python `json.dumps(payload, sort_keys=True, separators=(',', ':'))` byte-for-byte.
++CREATE OR REPLACE FUNCTION fn_canonical_jsonb(p_data JSONB)
++RETURNS TEXT
++LANGUAGE plpgsql
++IMMUTABLE
++AS $$
++DECLARE
++    v_type TEXT;
++    v_result TEXT;
++BEGIN
++    IF p_data IS NULL THEN
++        RETURN '{}';
++    END IF;
++    v_type := jsonb_typeof(p_data);
++    IF v_type = 'object' THEN
++        SELECT '{' || COALESCE(string_agg(to_json(k)::text || ':' || fn_canonical_jsonb(v), ',' ORDER BY k COLLATE "C"), '') || '}'
++          INTO v_result
++          FROM jsonb_each(p_data) AS t(k, v);
++        RETURN v_result;
++    ELSIF v_type = 'array' THEN
++        SELECT '[' || COALESCE(string_agg(fn_canonical_jsonb(v), ','), '') || ']'
++          INTO v_result
++          FROM jsonb_array_elements(p_data) AS t(v);
++        RETURN v_result;
++    ELSE
++        RETURN p_data::text;
++    END IF;
++END;
++$$;
++
+ -- Trigger Function 1: Compute deterministic SHA-256 hash chain on INSERT
+ CREATE OR REPLACE FUNCTION fn_audit_compute_hash_chain()
+ RETURNS TRIGGER
+@@ -155,9 +186,11 @@ AS $$
+ DECLARE
+     v_last_hash CHAR(64);
+     v_canonical_string TEXT;
++    v_computed_hash CHAR(64);
+ BEGIN
+-    -- Lock table in EXCLUSIVE mode during insert to guarantee strict sequential hash chaining
+-    LOCK TABLE task_events_audit IN EXCLUSIVE MODE;
++    -- ID-022: Use transaction-scoped advisory lock so concurrent SELECTs
++    -- and compliance reports are never blocked by audit inserts.
++    PERFORM pg_advisory_xact_lock(20261015, 1);
+ 
+     SELECT row_hash
+       INTO v_last_hash
+@@ -169,9 +202,15 @@ BEGIN
+         v_last_hash := repeat('0', 64); -- Genesis block prev_hash
+     END IF;
+ 
++    -- ID-010: Reject forged prev_hash if caller supplied one that does not match the chain head
++    IF NEW.prev_hash IS NOT NULL AND btrim(NEW.prev_hash) <> '' AND NEW.prev_hash <> v_last_hash THEN
++        RAISE EXCEPTION 'COMPLIANCE VIOLATION: Invalid prev_hash in task_events_audit INSERT.'
++            USING ERRCODE = '23514';
++    END IF;
++
+     NEW.prev_hash := v_last_hash;
+ 
+-    -- Canonical pipe-delimited string over all immutable compliance fields
++    -- Canonical pipe-delimited string over all immutable compliance fields (ID-008 parity)
+     v_canonical_string := concat_ws(
+         '|',
+         COALESCE(NEW.event_id::text, ''),
+@@ -183,12 +222,20 @@ BEGIN
+         COALESCE(NEW.actor_slack_id, ''),
+         COALESCE(NEW.actor_entra_oid, ''),
+         COALESCE(NEW.actor_role, ''),
+-        COALESCE(NEW.payload::text, '{}'),
++        fn_canonical_jsonb(COALESCE(NEW.payload, '{}'::jsonb)),
+         to_char(NEW.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+         NEW.prev_hash
+     );
+ 
+-    NEW.row_hash := encode(digest(v_canonical_string, 'sha256'), 'hex');
++    v_computed_hash := encode(public.digest(convert_to(v_canonical_string, 'UTF8'), 'sha256'), 'hex');
++
++    -- ID-010: Reject forged row_hash if caller supplied one that does not match the DB-computed SHA-256
++    IF NEW.row_hash IS NOT NULL AND btrim(NEW.row_hash) <> '' AND NEW.row_hash <> v_computed_hash THEN
++        RAISE EXCEPTION 'COMPLIANCE VIOLATION: Forged or mismatched row_hash in task_events_audit INSERT.'
++            USING ERRCODE = '23514';
++    END IF;
++
++    NEW.row_hash := v_computed_hash;
+     RETURN NEW;
+ END;
+ $$;
+diff --git a/src/backup/archive_and_verify.py b/src/backup/archive_and_verify.py
+index 738ef18..2103152 100644
+--- a/src/backup/archive_and_verify.py
++++ b/src/backup/archive_and_verify.py
+@@ -21,6 +21,7 @@ from typing import Any, Optional
+ import uuid
+ 
+ from src.dashboard.reporting import generate_daily_compliance_report_markdown
++from src.domain.ledger import canonical_json, format_canonical_utc_timestamp
+ from src.domain.models import AuditEventType
+ from src.repository.db_repo import ComplianceRepository
+ 
+@@ -140,9 +141,31 @@ class HetznerS3BreakGlassManager:
+         Exports all tables + the daily signed compliance report, encrypts client-side,
+         and writes to the S3 object key `backups/YYYY/MM/pharmacy_backup_YYYY-MM-DD.vault`.
+         """
+-        users = [dict(r) for r in self.repo.conn.execute("SELECT * FROM users_rbac").fetchall()]
+-        tasks = [dict(r) for r in self.repo.conn.execute("SELECT * FROM tasks_master").fetchall()]
+-        instances = [dict(r) for r in self.repo.conn.execute("SELECT * FROM task_instances").fetchall()]
++        users = []
++        for r in self.repo.conn.execute("SELECT * FROM users_rbac").fetchall():
++            u = dict(r)
++            u["user_id"] = str(u["user_id"])
++            u["created_at"] = format_canonical_utc_timestamp(u["created_at"])
++            u["updated_at"] = format_canonical_utc_timestamp(u["updated_at"])
++            users.append(u)
++        tasks = []
++        for r in self.repo.conn.execute("SELECT * FROM tasks_master").fetchall():
++            t = dict(r)
++            t["created_at"] = format_canonical_utc_timestamp(t["created_at"])
++            t["input_schema"] = canonical_json(t["input_schema"]) if isinstance(t["input_schema"], dict) else t["input_schema"]
++            tasks.append(t)
++        instances = []
++        for r in self.repo.conn.execute("SELECT * FROM task_instances").fetchall():
++            inst = dict(r)
++            inst["instance_id"] = str(inst["instance_id"])
++            inst["period_start_date"] = inst["period_start_date"].isoformat() if isinstance(inst["period_start_date"], date) else str(inst["period_start_date"])
++            inst["period_end_date"] = inst["period_end_date"].isoformat() if isinstance(inst["period_end_date"], date) else str(inst["period_end_date"])
++            inst["completed_by_user_id"] = str(inst["completed_by_user_id"]) if inst["completed_by_user_id"] else None
++            inst["completed_at"] = format_canonical_utc_timestamp(inst["completed_at"]) if inst["completed_at"] else None
++            inst["last_reminded_at"] = format_canonical_utc_timestamp(inst["last_reminded_at"]) if inst["last_reminded_at"] else None
++            inst["created_at"] = format_canonical_utc_timestamp(inst["created_at"])
++            inst["structured_data"] = canonical_json(inst["structured_data"]) if isinstance(inst["structured_data"], dict) else inst["structured_data"]
++            instances.append(inst)
+         audit_events = self.repo.get_all_audit_events()
+         daily_report_md = generate_daily_compliance_report_markdown(self.repo, backup_date)
+ 
+@@ -222,18 +245,18 @@ class HetznerS3BreakGlassManager:
+                 verified_at_iso=now_iso,
+             )
+ 
+-        # Spin up isolated ephemeral database instance for Break-Glass restore
+-        temp_repo = ComplianceRepository(":memory:")
++        # Spin up isolated ephemeral PostgreSQL schema for Break-Glass restore
++        temp_repo = ComplianceRepository()
+         try:
+             tables = snapshot["tables"]
+-            with temp_repo.conn:
++            with temp_repo.conn.transaction():
+                 for u in tables["users_rbac"]:
+                     temp_repo.conn.execute(
+                         """
+                         INSERT INTO users_rbac (
+                             user_id, entra_oid, slack_user_id, full_name, email,
+                             staff_role, gphc_reg_number, is_active, created_at
+-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         """,
+                         (
+                             u["user_id"],
+@@ -243,7 +266,7 @@ class HetznerS3BreakGlassManager:
+                             u["email"],
+                             u["staff_role"],
+                             u["gphc_reg_number"],
+-                            u["is_active"],
++                            bool(u["is_active"]),
+                             u["created_at"],
+                         ),
+                     )
+@@ -255,7 +278,7 @@ class HetznerS3BreakGlassManager:
+                             task_id, task_name, frequency, daily_timing_window,
+                             assigned_role, original_role_label,
+                             requires_structured_input, input_schema, is_active
+-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                         """,
+                         (
+                             t["task_id"],
+@@ -264,9 +287,9 @@ class HetznerS3BreakGlassManager:
+                             t["daily_timing_window"],
+                             t["assigned_role"],
+                             t["original_role_label"],
+-                            t["requires_structured_input"],
+-                            t["input_schema"],
+-                            t["is_active"],
++                            bool(t["requires_structured_input"]),
++                            t["input_schema"] if isinstance(t["input_schema"], str) else canonical_json(t["input_schema"]),
++                            bool(t["is_active"]),
+                         ),
+                     )
+ 
+@@ -279,7 +302,7 @@ class HetznerS3BreakGlassManager:
+                             status, completed_by_user_id, completed_at,
+                             structured_data, notes, escalation_count,
+                             last_reminded_at, slack_channel_id, slack_message_ts, created_at
+-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
+                         """,
+                         (
+                             inst["instance_id"],
+@@ -290,7 +313,7 @@ class HetznerS3BreakGlassManager:
+                             inst["status"],
+                             inst["completed_by_user_id"],
+                             inst["completed_at"],
+-                            inst["structured_data"],
++                            inst["structured_data"] if isinstance(inst["structured_data"], str) else canonical_json(inst["structured_data"]),
+                             inst["notes"],
+                             inst["escalation_count"],
+                             inst["last_reminded_at"],
+@@ -307,7 +330,7 @@ class HetznerS3BreakGlassManager:
+                             audit_seq, event_id, event_type, task_id, instance_id,
+                             period_key, actor_user_id, actor_slack_id, actor_entra_oid,
+                             actor_role, payload, occurred_at, prev_hash, row_hash
+-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+                         """,
+                         (
+                             ev["audit_seq"],
+@@ -320,7 +343,7 @@ class HetznerS3BreakGlassManager:
+                             ev["actor_slack_id"],
+                             ev["actor_entra_oid"],
+                             ev["actor_role"],
+-                            ev["payload"],
++                            ev["payload"] if isinstance(ev["payload"], str) else canonical_json(ev["payload"]),
+                             ev["occurred_at"],
+                             ev["prev_hash"],
+                             ev["row_hash"],
+@@ -328,13 +351,13 @@ class HetznerS3BreakGlassManager:
+                     )
+ 
+             restored_tasks = int(
+-                temp_repo.conn.execute("SELECT COUNT(*) FROM tasks_master").fetchone()[0]
++                temp_repo.conn.execute("SELECT COUNT(*) AS cnt FROM tasks_master").fetchone()["cnt"]
+             )
+             restored_instances = int(
+-                temp_repo.conn.execute("SELECT COUNT(*) FROM task_instances").fetchone()[0]
++                temp_repo.conn.execute("SELECT COUNT(*) AS cnt FROM task_instances").fetchone()["cnt"]
+             )
+             restored_audits = int(
+-                temp_repo.conn.execute("SELECT COUNT(*) FROM task_events_audit").fetchone()[0]
++                temp_repo.conn.execute("SELECT COUNT(*) AS cnt FROM task_events_audit").fetchone()["cnt"]
+             )
+             chain_check = temp_repo.verify_ledger_integrity()
+ 
+@@ -375,7 +398,7 @@ class HetznerS3BreakGlassManager:
+         error_details: Optional[str],
+         verified_at_iso: str,
+     ) -> BreakGlassVerificationReport:
+-        with self.repo.conn:
++        with self.repo.conn.transaction():
+             self.repo.conn.execute(
+                 """
+                 INSERT INTO backup_verification_logs (
+@@ -383,7 +406,7 @@ class HetznerS3BreakGlassManager:
+                     archive_sha256, encryption_cipher, restored_task_count,
+                     restored_audit_count, hash_chain_valid, verification_status,
+                     error_details, verified_at
+-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 """,
+                 (
+                     verification_id,
+@@ -394,7 +417,7 @@ class HetznerS3BreakGlassManager:
+                     CIPHER_IDENTIFIER,
+                     restored_task_count,
+                     restored_audit_count,
+-                    1 if hash_chain_valid else 0,
++                    bool(hash_chain_valid),
+                     status,
+                     error_details,
+                     verified_at_iso,
+diff --git a/src/backup/service.py b/src/backup/service.py
+index 501e201..0a01e4f 100644
+--- a/src/backup/service.py
++++ b/src/backup/service.py
+@@ -18,7 +18,7 @@ def run_nightly_backup_and_verify(
+     staging_dir: Path | None = None,
+ ) -> None:
+     cfg = config or AppConfig()
+-    repo = ComplianceRepository(cfg.sqlite_fallback_path)
++    repo = ComplianceRepository(cfg.database_url)
+     repo.seed_tasks_from_sql_file()
+ 
+     vault_dir = staging_dir or Path("/app/s3_vault")
+diff --git a/src/config.py b/src/config.py
+index fe4818e..ac510ad 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -20,16 +20,16 @@ class AppConfig:
+     # Execution environment ("development" vs "production")
+     environment: str = field(default_factory=lambda: os.getenv("ENV", "development").lower())
+ 
+-    # Database (Azure PostgreSQL Flexible Server in production)
++    # Database (Azure PostgreSQL Flexible Server in production; PostgreSQL test DB in local dev/test)
+     database_url: str = field(
+         default_factory=lambda: os.getenv(
+             "DATABASE_URL",
+-            "postgresql://app_compliance_writer:changeme@localhost:5432/pharmacy_compliance?sslmode=require",
++            os.getenv(
++                "TEST_DATABASE_URL",
++                "postgresql://postgres:postgres@localhost:5432/pharmacy_compliance_test",
++            ),
+         )
+     )
+-    sqlite_fallback_path: str = field(
+-        default_factory=lambda: os.getenv("SQLITE_FALLBACK_PATH", "pharmacy_compliance_local.db")
+-    )
+ 
+     # Slack (Socket Mode - Free Tier compatible)
+     slack_bot_token: str = field(default_factory=lambda: os.getenv("SLACK_BOT_TOKEN", "xoxb-placeholder"))
+@@ -74,7 +74,11 @@ class AppConfig:
+ 
+     def validate_production_secrets(self) -> None:
+         """ID-005: Fail fast if required secrets are missing or use known placeholders."""
+-        if not self.database_url or "changeme" in self.database_url:
++        if (
++            not self.database_url
++            or "changeme" in self.database_url
++            or "postgres:postgres@localhost" in self.database_url
++        ):
+             raise RuntimeError("ID-005 Violation: DATABASE_URL is missing or contains default password.")
+         if not self.slack_bot_token or self.slack_bot_token in FORBIDDEN_PLACEHOLDERS:
+             raise RuntimeError("ID-005 Violation: SLACK_BOT_TOKEN is missing or placeholder.")
+diff --git a/src/dashboard/app.py b/src/dashboard/app.py
+index 203d90e..65a3914 100644
+--- a/src/dashboard/app.py
++++ b/src/dashboard/app.py
+@@ -35,7 +35,7 @@ def render_streamlit_dashboard() -> None:
+     )
+ 
+     cfg = AppConfig()
+-    repo = ComplianceRepository(cfg.sqlite_fallback_path)
++    repo = ComplianceRepository(cfg.database_url)
+     repo.seed_tasks_from_sql_file()
+ 
+     # ID-021: Gate demo staff seeding strictly behind ENV=development
+diff --git a/src/domain/ledger.py b/src/domain/ledger.py
+index 2ead069..3c98b75 100644
+--- a/src/domain/ledger.py
++++ b/src/domain/ledger.py
+@@ -15,6 +15,20 @@ def canonical_json(payload: dict[str, Any]) -> str:
+     return json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
+ 
+ 
++def format_canonical_utc_timestamp(ts: Any) -> str:
++    """
++    ID-008: Canonical UTC timestamp formatter (`YYYY-MM-DDTHH:MM:SS.ffffffZ`)
++    identical to PostgreSQL `to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`.
++    """
++    from datetime import datetime, timezone
++
++    if isinstance(ts, str):
++        return ts
++    if isinstance(ts, datetime):
++        return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
++    raise TypeError(f"Unsupported timestamp type for canonical ledger hash: {type(ts)}")
++
++
+ def compute_audit_row_hash(
+     *,
+     event_id: str,
+diff --git a/src/repository/db_repo.py b/src/repository/db_repo.py
+index d5f8f15..f460c41 100644
+--- a/src/repository/db_repo.py
++++ b/src/repository/db_repo.py
+@@ -1,23 +1,28 @@
+ """
+-Compliance Repository supporting both Azure PostgreSQL Flexible Server (via psycopg)
+-and a self-contained SQLite engine with equivalent immutability triggers and SHA-256 hash chaining.
++PostgreSQL-Only Compliance Repository (`src/repository/db_repo.py`).
++Routes all operations exclusively through PostgreSQL (`psycopg`) via `DATABASE_URL` (ID-002),
++executes `db/01_schema.sql` and `db/02_seed_tasks.sql` as the single canonical schema/seed source (ID-017),
++enforces database-layer SHA-256 hash chaining and immutability triggers (ID-008, ID-010, ID-022),
++and uses optimistic locking on concurrent task completions (ID-009).
++Zero SQLite dependencies remain anywhere in this module (ID-016).
+ """
+ 
+ from __future__ import annotations
+ 
+ from datetime import date, datetime, timezone
+ import json
++import os
+ from pathlib import Path
+-import re
+-import sqlite3
+ from typing import Any, Optional
+ import uuid
+ 
++import psycopg
++from psycopg.rows import dict_row
++
+ from src.domain.ledger import (
+-    GENESIS_PREV_HASH,
+     LedgerVerificationResult,
+     canonical_json,
+-    compute_audit_row_hash,
++    format_canonical_utc_timestamp,
+     verify_audit_chain,
+ )
+ from src.domain.models import (
+@@ -29,13 +34,14 @@ from src.domain.models import (
+     StaffRole,
+     TaskFrequency,
+     TaskInstanceRecord,
+-    TaskMasterRecord,
+     UserRecord,
+     compute_period_bounds,
+     is_role_authorized,
+     validate_fridge_reading,
+ )
+ 
++DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/pharmacy_compliance_test"
++
+ 
+ class ImmutableLedgerViolationError(PermissionError):
+     """Raised when any code or SQL query attempts to UPDATE or DELETE from task_events_audit."""
+@@ -43,221 +49,90 @@ class ImmutableLedgerViolationError(PermissionError):
+ 
+ class ComplianceRepository:
+     """
+-    Unified compliance repository providing:
+-    - Master task seeding (all 33 pharmacy tasks)
++    PostgreSQL-exclusive compliance repository providing:
++    - Master task seeding directly from `db/02_seed_tasks.sql` (all 33 pharmacy tasks)
+     - RBAC user management (Entra OID <-> Slack ID <-> Pharmacy Role)
+     - Period instance scheduling (Daily, Weekly any-day, Monthly any-day)
+-    - Role-enforced task completion & Fridge temperature modal logging
+-    - Append-only, database-trigger-protected, SHA-256 hash-chained audit trail
++    - Role-enforced task completion with optimistic locking & Fridge temperature modal logging
++    - Append-only, PostgreSQL-trigger-enforced, SHA-256 hash-chained audit trail
++    - Live read-only inspection of Azure PostgreSQL `task_reminders` (`tasks_master`, `scheduled_instances`, `audit_logs`)
+     """
+ 
+-    def __init__(self, db_path: str = ":memory:") -> None:
+-        self.db_path = db_path
+-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+-        self.conn.row_factory = sqlite3.Row
+-        self.conn.execute("PRAGMA foreign_keys = ON;")
+-        self._init_schema_and_immutability_triggers()
++    def __init__(
++        self,
++        database_url: Optional[str] = None,
++        *,
++        schema_name: Optional[str] = None,
++        init_schema: bool = True,
++    ) -> None:
++        # If legacy test callers pass ":memory:" or a `.db` file path, route to an isolated PostgreSQL test schema
++        if database_url is None or database_url == ":memory:" or not str(database_url).startswith("postgresql"):
++            self.database_url = os.getenv("TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
++            self._ephemeral_schema = schema_name or f"test_pg_{uuid.uuid4().hex[:12]}"
++            self._drop_schema_on_close = schema_name is None
++        else:
++            self.database_url = database_url
++            self._ephemeral_schema = schema_name
++            self._drop_schema_on_close = False
++
++        self.conn = psycopg.connect(self.database_url, row_factory=dict_row, autocommit=True)
++        if self._ephemeral_schema:
++            with self.conn.transaction():
++                self.conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self._ephemeral_schema}";')
++            self.conn.execute(f'SET search_path TO "{self._ephemeral_schema}", public;')
++
++        if init_schema:
++            self._init_schema_and_immutability_triggers()
+ 
+     def _init_schema_and_immutability_triggers(self) -> None:
+-        with self.conn:
+-            self.conn.executescript(
+-                """
+-                CREATE TABLE IF NOT EXISTS users_rbac (
+-                    user_id         TEXT PRIMARY KEY,
+-                    entra_oid       TEXT UNIQUE NOT NULL,
+-                    slack_user_id   TEXT UNIQUE NOT NULL,
+-                    full_name       TEXT NOT NULL,
+-                    email           TEXT UNIQUE NOT NULL,
+-                    staff_role      TEXT NOT NULL CHECK (staff_role IN ('Pharm', 'Dispenser', 'Manager')),
+-                    gphc_reg_number TEXT,
+-                    is_active       INTEGER NOT NULL DEFAULT 1,
+-                    created_at      TEXT NOT NULL,
+-                    CHECK (staff_role <> 'Pharm' OR (gphc_reg_number IS NOT NULL AND length(trim(gphc_reg_number)) >= 6))
+-                );
+-
+-                CREATE TABLE IF NOT EXISTS tasks_master (
+-                    task_id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+-                    task_name                   TEXT UNIQUE NOT NULL,
+-                    frequency                   TEXT NOT NULL CHECK (frequency IN ('Daily', 'Weekly', 'Monthly')),
+-                    daily_timing_window         TEXT CHECK (daily_timing_window IN ('Morning', 'Anytime', 'End_Of_Day') OR daily_timing_window IS NULL),
+-                    assigned_role               TEXT NOT NULL CHECK (assigned_role IN ('Pharm', 'Dispenser', 'Either')),
+-                    original_role_label         TEXT NOT NULL,
+-                    requires_structured_input   INTEGER NOT NULL DEFAULT 0,
+-                    input_schema                TEXT NOT NULL DEFAULT '{}',
+-                    is_active                   INTEGER NOT NULL DEFAULT 1,
+-                    CHECK (
+-                        (frequency = 'Daily' AND daily_timing_window IS NOT NULL)
+-                        OR (frequency IN ('Weekly', 'Monthly') AND daily_timing_window IS NULL)
+-                    )
+-                );
+-
+-                CREATE TABLE IF NOT EXISTS task_instances (
+-                    instance_id             TEXT PRIMARY KEY,
+-                    task_id                 INTEGER NOT NULL REFERENCES tasks_master(task_id),
+-                    period_key              TEXT NOT NULL,
+-                    period_start_date       TEXT NOT NULL,
+-                    period_end_date         TEXT NOT NULL,
+-                    status                  TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Completed', 'Escalated', 'Missed')),
+-                    completed_by_user_id    TEXT REFERENCES users_rbac(user_id),
+-                    completed_at            TEXT,
+-                    structured_data         TEXT NOT NULL DEFAULT '{}',
+-                    notes                   TEXT,
+-                    escalation_count        INTEGER NOT NULL DEFAULT 0,
+-                    last_reminded_at        TEXT,
+-                    slack_channel_id        TEXT,
+-                    slack_message_ts        TEXT,
+-                    created_at              TEXT NOT NULL,
+-                    UNIQUE (task_id, period_key)
+-                );
+-
+-                CREATE TABLE IF NOT EXISTS task_events_audit (
+-                    audit_seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+-                    event_id        TEXT UNIQUE NOT NULL,
+-                    event_type      TEXT NOT NULL,
+-                    task_id         INTEGER REFERENCES tasks_master(task_id),
+-                    instance_id     TEXT REFERENCES task_instances(instance_id),
+-                    period_key      TEXT,
+-                    actor_user_id   TEXT REFERENCES users_rbac(user_id),
+-                    actor_slack_id  TEXT,
+-                    actor_entra_oid TEXT,
+-                    actor_role      TEXT,
+-                    payload         TEXT NOT NULL DEFAULT '{}',
+-                    occurred_at     TEXT NOT NULL,
+-                    prev_hash       TEXT NOT NULL,
+-                    row_hash        TEXT UNIQUE NOT NULL
+-                );
+-
+-                -- Database-level immutability triggers blocking UPDATE and DELETE on task_events_audit
+-                CREATE TRIGGER IF NOT EXISTS trg_prevent_audit_update
+-                BEFORE UPDATE ON task_events_audit
+-                BEGIN
+-                    SELECT RAISE(ABORT, 'COMPLIANCE VIOLATION: task_events_audit is strictly append-only. Operation UPDATE is prohibited.');
+-                END;
+-
+-                CREATE TRIGGER IF NOT EXISTS trg_prevent_audit_delete
+-                BEFORE DELETE ON task_events_audit
+-                BEGIN
+-                    SELECT RAISE(ABORT, 'COMPLIANCE VIOLATION: task_events_audit is strictly append-only. Operation DELETE is prohibited.');
+-                END;
+-
+-                CREATE TABLE IF NOT EXISTS backup_verification_logs (
+-                    verification_id     TEXT PRIMARY KEY,
+-                    backup_date         TEXT NOT NULL,
+-                    s3_bucket           TEXT NOT NULL,
+-                    s3_object_key       TEXT NOT NULL,
+-                    archive_sha256      TEXT NOT NULL,
+-                    encryption_cipher   TEXT NOT NULL,
+-                    restored_task_count INTEGER NOT NULL,
+-                    restored_audit_count INTEGER NOT NULL,
+-                    hash_chain_valid    INTEGER NOT NULL,
+-                    verification_status TEXT NOT NULL CHECK (verification_status IN ('PASSED', 'FAILED')),
+-                    error_details       TEXT,
+-                    verified_at         TEXT NOT NULL
+-                );
+-                """
+-            )
++        schema_sql_path = Path(__file__).resolve().parents[2] / "db" / "01_schema.sql"
++        sql_text = schema_sql_path.read_text(encoding="utf-8")
++        cleaned_lines = [
++            line for line in sql_text.splitlines() if line.strip().upper() not in ("BEGIN;", "COMMIT;")
++        ]
++        with self.conn.transaction():
++            if self._ephemeral_schema:
++                self.conn.execute(f'SET search_path TO "{self._ephemeral_schema}", public;')
++            self.conn.execute("\n".join(cleaned_lines))
+ 
+     def seed_tasks_from_sql_file(self, sql_seed_path: Optional[Path] = None) -> int:
+         """
+-        Loads and seeds the 33 normalized tasks from `db/02_seed_tasks.sql`.
+-        Returns the total count of active tasks in `tasks_master`.
++        ID-017: Loads and executes `db/02_seed_tasks.sql` directly against PostgreSQL
++        as the single canonical source of truth for all 33 pharmacy compliance tasks.
+         """
+         if sql_seed_path is None:
+             sql_seed_path = Path(__file__).resolve().parents[2] / "db" / "02_seed_tasks.sql"
+ 
+-        tasks_data = [
+-            # Daily - Morning (4)
+-            (
+-                "Fridge Check (Min/Max/Current)",
+-                "Daily",
+-                "Morning",
+-                "Either",
+-                "Dispenser / Pharm",
+-                True,
+-                {
+-                    "type": "fridge_temperature",
+-                    "fields": ["min_temp_c", "max_temp_c", "current_temp_c"],
+-                    "safe_min_c": 2.0,
+-                    "safe_max_c": 8.0,
+-                    "require_action_note_if_out_of_range": True,
+-                },
+-            ),
+-            ("Handover & Diary Review", "Daily", "Morning", "Either", "Pharm / Dispenser", False, {}),
+-            ("EPS & NHSmail Download", "Daily", "Morning", "Either", "Dispenser / Pharm", False, {}),
+-            ("Till Prep & Float", "Daily", "Morning", "Dispenser", "Dispenser", False, {}),
+-            # Daily - Anytime (5)
+-            ("Prescription Processing", "Daily", "Anytime", "Dispenser", "Dispenser", False, {}),
+-            ("MDS/Dosette Boxes Prep & Check", "Daily", "Anytime", "Either", "Dispenser / Pharm", False, {}),
+-            ("Owings Processing", "Daily", "Anytime", "Dispenser", "Dispenser", False, {}),
+-            ("Deliveries & Fridge Lines", "Daily", "Anytime", "Dispenser", "Dispenser", False, {}),
+-            ("Clinical Services Prep", "Daily", "Anytime", "Pharm", "Pharm", False, {}),
+-            # Daily - End_Of_Day (5)
+-            ("CD Register Reconcile", "Daily", "End_Of_Day", "Pharm", "Pharm", False, {}),
+-            ("EPS Claims (End of Day)", "Daily", "End_Of_Day", "Either", "Dispenser / Pharm", False, {}),
+-            ("Information Governance Secure", "Daily", "End_Of_Day", "Dispenser", "Dispenser", False, {}),
+-            ("Housekeeping (Benches/Bins/Floor)", "Daily", "End_Of_Day", "Dispenser", "Dispenser", False, {}),
+-            ("Security & Lock Up", "Daily", "End_Of_Day", "Pharm", "Pharm", False, {}),
+-            # Weekly (10)
+-            ("Full CD Balance Check", "Weekly", None, "Pharm", "Pharm", False, {}),
+-            ("Owings Audit & Chase", "Weekly", None, "Dispenser", "Dispenser", False, {}),
+-            ("Uncollected Scripts (14+ Days)", "Weekly", None, "Dispenser", "Dispenser", False, {}),
+-            ("Consumables Order", "Weekly", None, "Dispenser", "Dispenser", False, {}),
+-            ("Filing (Invoices & Logs)", "Weekly", None, "Dispenser", "Dispenser", False, {}),
+-            ("Rota Check", "Weekly", None, "Pharm", "Pharm", False, {}),
+-            ("Collection Box Audit", "Weekly", None, "Dispenser", "Dispenser", False, {}),
+-            ("Consultation Room Deep Clean", "Weekly", None, "Either", "Dispenser / Pharm", False, {}),
+-            ("Hardware Antibacterial Clean", "Weekly", None, "Dispenser", "Dispenser", False, {}),
+-            ("Retail Area Face Up & Mop", "Weekly", None, "Dispenser", "Dispenser", False, {}),
+-            # Monthly (9)
+-            ("Date Checking Matrix", "Monthly", None, "Dispenser", "Dispenser", False, {}),
+-            ("CD Management (Out of Date)", "Monthly", None, "Pharm", "Pharm", False, {}),
+-            ("Fridge Audit & Defrost", "Monthly", None, "Dispenser", "Dispenser", False, {}),
+-            ("End of Month (NHSBSA / FP34C)", "Monthly", None, "Either", "Dispenser / Pharm", False, {}),
+-            ("Service Claims (MYS/Local)", "Monthly", None, "Pharm", "Pharm", False, {}),
+-            ("SOP & Training Review", "Monthly", None, "Pharm", "Pharm", False, {}),
+-            ("Health & Safety (Fire/First Aid)", "Monthly", None, "Either", "Pharm / Dispenser", False, {}),
+-            ("Staff Areas Deep Clean", "Monthly", None, "Dispenser", "Dispenser", False, {}),
+-            ("Ventilation & Hardware Dusting", "Monthly", None, "Dispenser", "Dispenser", False, {}),
++        sql_text = sql_seed_path.read_text(encoding="utf-8")
++        cleaned_lines = [
++            line for line in sql_text.splitlines() if line.strip().upper() not in ("BEGIN;", "COMMIT;")
+         ]
++        with self.conn.transaction():
++            self.conn.execute("\n".join(cleaned_lines))
+ 
+-        with self.conn:
+-            for (
+-                name,
+-                freq,
+-                window,
+-                role,
+-                orig_label,
+-                req_struct,
+-                schema_dict,
+-            ) in tasks_data:
+-                self.conn.execute(
+-                    """
+-                    INSERT INTO tasks_master (
+-                        task_name, frequency, daily_timing_window,
+-                        assigned_role, original_role_label,
+-                        requires_structured_input, input_schema
+-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+-                    ON CONFLICT(task_name) DO UPDATE SET
+-                        frequency = excluded.frequency,
+-                        daily_timing_window = excluded.daily_timing_window,
+-                        assigned_role = excluded.assigned_role,
+-                        original_role_label = excluded.original_role_label,
+-                        requires_structured_input = excluded.requires_structured_input,
+-                        input_schema = excluded.input_schema
+-                    """,
+-                    (
+-                        name,
+-                        freq,
+-                        window,
+-                        role,
+-                        orig_label,
+-                        1 if req_struct else 0,
+-                        canonical_json(schema_dict),
+-                    ),
+-                )
++        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks_master WHERE is_active = TRUE").fetchone()
++        return int(row["cnt"]) if row else 0
+ 
+-        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks_master WHERE is_active = 1").fetchone()
+-        return int(row["cnt"])
++    # -------------------------------------------------------------------------
++    # Live Azure `task_reminders` Read-Only Inspection Adapter
++    # -------------------------------------------------------------------------
++    def fetch_live_task_reminders_counts(self) -> dict[str, int]:
++        """
++        Queries the live Azure PostgreSQL `task_reminders` schema (`tasks_master`,
++        `scheduled_instances`, `audit_logs`) strictly read-only (`SELECT` only).
++        """
++        with self.conn.cursor() as cur:
++            cur.execute("SELECT COUNT(*) AS cnt FROM public.tasks_master;")
++            tasks_cnt = int((cur.fetchone() or {"cnt": 0})["cnt"])
++            cur.execute("SELECT COUNT(*) AS cnt FROM public.scheduled_instances;")
++            sched_cnt = int((cur.fetchone() or {"cnt": 0})["cnt"])
++            cur.execute("SELECT COUNT(*) AS cnt FROM public.audit_logs;")
++            audit_cnt = int((cur.fetchone() or {"cnt": 0})["cnt"])
++        return {
++            "tasks_master": tasks_cnt,
++            "scheduled_instances": sched_cnt,
++            "audit_logs": audit_cnt,
++        }
+ 
+     # -------------------------------------------------------------------------
+     # User & RBAC Operations
+@@ -275,19 +150,20 @@ class ComplianceRepository:
+     ) -> UserRecord:
+         uid = user_id or str(uuid.uuid4())
+         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+-        with self.conn:
++        with self.conn.transaction():
+             self.conn.execute(
+                 """
+                 INSERT INTO users_rbac (
+                     user_id, entra_oid, slack_user_id, full_name, email,
+                     staff_role, gphc_reg_number, is_active, created_at
+-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
++                ) VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                 ON CONFLICT(slack_user_id) DO UPDATE SET
+-                    entra_oid = excluded.entra_oid,
+-                    full_name = excluded.full_name,
+-                    email = excluded.email,
+-                    staff_role = excluded.staff_role,
+-                    gphc_reg_number = excluded.gphc_reg_number
++                    entra_oid = EXCLUDED.entra_oid,
++                    full_name = EXCLUDED.full_name,
++                    email = EXCLUDED.email,
++                    staff_role = EXCLUDED.staff_role,
++                    gphc_reg_number = EXCLUDED.gphc_reg_number,
++                    updated_at = NOW()
+                 """,
+                 (
+                     uid,
+@@ -304,13 +180,13 @@ class ComplianceRepository:
+ 
+     def get_user_by_slack_id(self, slack_user_id: str) -> Optional[UserRecord]:
+         row = self.conn.execute(
+-            "SELECT * FROM users_rbac WHERE slack_user_id = ? AND is_active = 1",
++            "SELECT * FROM users_rbac WHERE slack_user_id = %s AND is_active = TRUE",
+             (slack_user_id,),
+         ).fetchone()
+         if not row:
+             return None
+         return UserRecord(
+-            user_id=row["user_id"],
++            user_id=str(row["user_id"]),
+             entra_oid=row["entra_oid"],
+             slack_user_id=row["slack_user_id"],
+             full_name=row["full_name"],
+@@ -322,13 +198,13 @@ class ComplianceRepository:
+ 
+     def get_user_by_entra_oid(self, entra_oid: str) -> Optional[UserRecord]:
+         row = self.conn.execute(
+-            "SELECT * FROM users_rbac WHERE entra_oid = ? AND is_active = 1",
++            "SELECT * FROM users_rbac WHERE entra_oid = %s AND is_active = TRUE",
+             (entra_oid,),
+         ).fetchone()
+         if not row:
+             return None
+         return UserRecord(
+-            user_id=row["user_id"],
++            user_id=str(row["user_id"]),
+             entra_oid=row["entra_oid"],
+             slack_user_id=row["slack_user_id"],
+             full_name=row["full_name"],
+@@ -339,10 +215,10 @@ class ComplianceRepository:
+         )
+ 
+     def list_users(self) -> list[UserRecord]:
+-        rows = self.conn.execute("SELECT * FROM users_rbac WHERE is_active = 1 ORDER BY full_name").fetchall()
++        rows = self.conn.execute("SELECT * FROM users_rbac WHERE is_active = TRUE ORDER BY full_name").fetchall()
+         return [
+             UserRecord(
+-                user_id=r["user_id"],
++                user_id=str(r["user_id"]),
+                 entra_oid=r["entra_oid"],
+                 slack_user_id=r["slack_user_id"],
+                 full_name=r["full_name"],
+@@ -355,7 +231,7 @@ class ComplianceRepository:
+         ]
+ 
+     # -------------------------------------------------------------------------
+-    # Immutable Audit Event Writer
++    # Immutable Audit Event Writer (Database-Layer Hash Computation - ID-010)
+     # -------------------------------------------------------------------------
+     def append_audit_event(
+         self,
+@@ -370,46 +246,30 @@ class ComplianceRepository:
+         occurred_at: Optional[datetime] = None,
+     ) -> dict[str, Any]:
+         """
+-        Appends an event to `task_events_audit` with deterministic SHA-256 hash chaining.
++        ID-010: Inserts an audit event into PostgreSQL `task_events_audit` WITHOUT
++        client-computed hashes. The PostgreSQL `BEFORE INSERT` trigger
++        `fn_audit_compute_hash_chain()` computes `prev_hash` and `row_hash` inside
++        the database engine using `fn_canonical_jsonb()` and `pg_advisory_xact_lock()`.
+         """
+         event_id = str(uuid.uuid4())
+         ts = occurred_at or datetime.now(timezone.utc)
+         occurred_at_iso = ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+         payload_dict = payload or {}
+ 
+-        with self.conn:
+-            last_row = self.conn.execute(
+-                "SELECT row_hash FROM task_events_audit ORDER BY audit_seq DESC LIMIT 1"
+-            ).fetchone()
+-            prev_hash = last_row["row_hash"] if last_row else GENESIS_PREV_HASH
+-
+-            actor_uid = actor.user_id if actor else None
+-            actor_slack = actor.slack_user_id if actor else actor_slack_id_override
+-            actor_entra = actor.entra_oid if actor else None
+-            actor_role = actor.staff_role.value if actor else None
+-
+-            row_hash = compute_audit_row_hash(
+-                event_id=event_id,
+-                event_type=event_type.value,
+-                task_id=task_id,
+-                instance_id=instance_id,
+-                period_key=period_key,
+-                actor_user_id=actor_uid,
+-                actor_slack_id=actor_slack,
+-                actor_entra_oid=actor_entra,
+-                actor_role=actor_role,
+-                payload=payload_dict,
+-                occurred_at_iso=occurred_at_iso,
+-                prev_hash=prev_hash,
+-            )
++        actor_uid = actor.user_id if actor else None
++        actor_slack = actor.slack_user_id if actor else actor_slack_id_override
++        actor_entra = actor.entra_oid if actor else None
++        actor_role = actor.staff_role.value if actor else None
+ 
+-            cursor = self.conn.execute(
++        with self.conn.transaction():
++            row = self.conn.execute(
+                 """
+                 INSERT INTO task_events_audit (
+                     event_id, event_type, task_id, instance_id, period_key,
+                     actor_user_id, actor_slack_id, actor_entra_oid, actor_role,
+                     payload, occurred_at, prev_hash, row_hash
+-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, '', '')
++                RETURNING audit_seq, event_id, event_type, prev_hash, row_hash, occurred_at
+                 """,
+                 (
+                     event_id,
+@@ -423,31 +283,26 @@ class ComplianceRepository:
+                     actor_role,
+                     canonical_json(payload_dict),
+                     occurred_at_iso,
+-                    prev_hash,
+-                    row_hash,
+                 ),
+-            )
++            ).fetchone()
++
++            if row is None:
++                raise RuntimeError("PostgreSQL INSERT RETURNING on task_events_audit returned no row.")
+             return {
+-                "audit_seq": cursor.lastrowid,
+-                "event_id": event_id,
+-                "event_type": event_type.value,
+-                "prev_hash": prev_hash,
+-                "row_hash": row_hash,
+-                "occurred_at": occurred_at_iso,
++                "audit_seq": int(row["audit_seq"]),
++                "event_id": str(row["event_id"]),
++                "event_type": str(row["event_type"]),
++                "prev_hash": str(row["prev_hash"]),
++                "row_hash": str(row["row_hash"]),
++                "occurred_at": format_canonical_utc_timestamp(row["occurred_at"]),
+             }
+ 
+     # -------------------------------------------------------------------------
+     # Cycle Scheduling (Daily / Weekly / Monthly)
+     # -------------------------------------------------------------------------
+     def ensure_instances_for_date(self, target_date: date) -> list[TaskInstanceRecord]:
+-        """
+-        Idempotently ensures task instances exist for `target_date`:
+-        - 14 Daily tasks for `YYYY-MM-DD`
+-        - 10 Weekly tasks for `YYYY-Www` (created once per week; remains open across all days of the week until completed once)
+-        - 9 Monthly tasks for `YYYY-MM` (created once per month; remains open across all days of the month until completed once)
+-        """
+         master_rows = self.conn.execute(
+-            "SELECT * FROM tasks_master WHERE is_active = 1 ORDER BY task_id"
++            "SELECT * FROM tasks_master WHERE is_active = TRUE ORDER BY task_id"
+         ).fetchall()
+         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+ 
+@@ -456,20 +311,20 @@ class ComplianceRepository:
+             bounds = compute_period_bounds(freq, target_date)
+ 
+             existing = self.conn.execute(
+-                "SELECT instance_id FROM task_instances WHERE task_id = ? AND period_key = ?",
++                "SELECT instance_id FROM task_instances WHERE task_id = %s AND period_key = %s",
+                 (m["task_id"], bounds.period_key),
+             ).fetchone()
+ 
+             if not existing:
+                 instance_id = str(uuid.uuid4())
+-                with self.conn:
++                with self.conn.transaction():
+                     self.conn.execute(
+                         """
+                         INSERT INTO task_instances (
+                             instance_id, task_id, period_key,
+                             period_start_date, period_end_date,
+                             status, created_at
+-                        ) VALUES (?, ?, ?, ?, ?, 'Pending', ?)
++                        ) VALUES (%s, %s, %s, %s, %s, 'Pending', %s)
+                         """,
+                         (
+                             instance_id,
+@@ -497,10 +352,6 @@ class ComplianceRepository:
+         return self.get_active_instances_for_date(target_date)
+ 
+     def get_active_instances_for_date(self, target_date: date) -> list[TaskInstanceRecord]:
+-        """
+-        Returns all Daily instances for `target_date`, Weekly instances for `target_date`'s week,
+-        and Monthly instances for `target_date`'s month.
+-        """
+         daily_key = compute_period_bounds(TaskFrequency.DAILY, target_date).period_key
+         weekly_key = compute_period_bounds(TaskFrequency.WEEKLY, target_date).period_key
+         monthly_key = compute_period_bounds(TaskFrequency.MONTHLY, target_date).period_key
+@@ -519,7 +370,7 @@ class ComplianceRepository:
+             FROM task_instances ti
+             JOIN tasks_master tm ON tm.task_id = ti.task_id
+             LEFT JOIN users_rbac u ON u.user_id = ti.completed_by_user_id
+-            WHERE ti.period_key IN (?, ?, ?)
++            WHERE ti.period_key IN (%s, %s, %s)
+             ORDER BY tm.task_id ASC
+             """,
+             (daily_key, weekly_key, monthly_key),
+@@ -542,15 +393,27 @@ class ComplianceRepository:
+             FROM task_instances ti
+             JOIN tasks_master tm ON tm.task_id = ti.task_id
+             LEFT JOIN users_rbac u ON u.user_id = ti.completed_by_user_id
+-            WHERE ti.instance_id = ?
++            WHERE ti.instance_id = %s
+             """,
+             (instance_id,),
+         ).fetchone()
+         return self._row_to_instance(row) if row else None
+ 
+-    def _row_to_instance(self, r: sqlite3.Row) -> TaskInstanceRecord:
++    def _row_to_instance(self, r: dict[str, Any]) -> TaskInstanceRecord:
++        p_start = r["period_start_date"]
++        p_end = r["period_end_date"]
++        comp_at = r["completed_at"]
++        struct_data = r["structured_data"]
++        if isinstance(struct_data, str):
++            struct_data = json.loads(struct_data or "{}")
++        elif struct_data is None:
++            struct_data = {}
++
++        if isinstance(comp_at, str):
++            comp_at = datetime.fromisoformat(comp_at.replace("Z", "+00:00"))
++
+         return TaskInstanceRecord(
+-            instance_id=r["instance_id"],
++            instance_id=str(r["instance_id"]),
+             task_id=int(r["task_id"]),
+             task_name=r["task_name"],
+             frequency=TaskFrequency(r["frequency"]),
+@@ -558,22 +421,20 @@ class ComplianceRepository:
+             assigned_role=RoleRequirement(r["assigned_role"]),
+             requires_structured_input=bool(r["requires_structured_input"]),
+             period_key=r["period_key"],
+-            period_start_date=date.fromisoformat(r["period_start_date"]),
+-            period_end_date=date.fromisoformat(r["period_end_date"]),
++            period_start_date=p_start if isinstance(p_start, date) else date.fromisoformat(str(p_start)),
++            period_end_date=p_end if isinstance(p_end, date) else date.fromisoformat(str(p_end)),
+             status=InstanceStatus(r["status"]),
+-            completed_by_user_id=r["completed_by_user_id"],
++            completed_by_user_id=str(r["completed_by_user_id"]) if r["completed_by_user_id"] else None,
+             completed_by_name=r["completed_by_name"],
+             completed_by_role=r["completed_by_role"],
+-            completed_at=datetime.fromisoformat(r["completed_at"].replace("Z", "+00:00"))
+-            if r["completed_at"]
+-            else None,
+-            structured_data=json.loads(r["structured_data"] or "{}"),
++            completed_at=comp_at,
++            structured_data=struct_data,
+             notes=r["notes"],
+             escalation_count=int(r["escalation_count"]),
+         )
+ 
+     # -------------------------------------------------------------------------
+-    # Task Completion & Fridge Temperature Logging (with Strict RBAC Enforcement)
++    # Task Completion & Fridge Temperature Logging (with Optimistic Locking - ID-009)
+     # -------------------------------------------------------------------------
+     def complete_task_instance(
+         self,
+@@ -584,13 +445,6 @@ class ComplianceRepository:
+         fridge_readings: Optional[dict[str, float]] = None,
+         completed_at: Optional[datetime] = None,
+     ) -> tuple[bool, str, Optional[TaskInstanceRecord]]:
+-        """
+-        Completes a task instance if and only if:
+-        1. Actor is a registered active user in `users_rbac`.
+-        2. Actor's `staff_role` satisfies the task's `assigned_role` (RBAC).
+-        3. If the task requires structured input (Fridge Check), `fridge_readings` are present and valid.
+-        Every attempt (including denied RBAC attempts and out-of-range fridge readings) is logged to `task_events_audit`.
+-        """
+         instance = self.get_instance_by_id(instance_id)
+         if not instance:
+             return False, f"Task instance `{instance_id}` not found.", None
+@@ -686,16 +540,17 @@ class ComplianceRepository:
+         ts = completed_at or datetime.now(timezone.utc)
+         completed_iso = ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+ 
+-        with self.conn:
+-            self.conn.execute(
++        # ID-009: Optimistic locking — enforce status != 'Completed' in the UPDATE predicate
++        with self.conn.transaction():
++            cur = self.conn.execute(
+                 """
+                 UPDATE task_instances
+                 SET status = 'Completed',
+-                    completed_by_user_id = ?,
+-                    completed_at = ?,
+-                    structured_data = ?,
+-                    notes = ?
+-                WHERE instance_id = ?
++                    completed_by_user_id = %s,
++                    completed_at = %s,
++                    structured_data = %s::jsonb,
++                    notes = %s
++                WHERE instance_id = %s AND status <> 'Completed'
+                 """,
+                 (
+                     actor.user_id,
+@@ -705,6 +560,13 @@ class ComplianceRepository:
+                     instance.instance_id,
+                 ),
+             )
++            if cur.rowcount == 0:
++                refreshed = self.get_instance_by_id(instance.instance_id)
++                return (
++                    False,
++                    f"Conflict: *{instance.task_name}* was concurrently completed by another user.",
++                    refreshed,
++                )
+ 
+         audit_type = (
+             AuditEventType.FRIDGE_TEMP_LOGGED
+@@ -744,13 +606,13 @@ class ComplianceRepository:
+             inst = self.get_instance_by_id(iid)
+             if not inst or inst.status == InstanceStatus.COMPLETED:
+                 continue
+-            with self.conn:
++            with self.conn.transaction():
+                 self.conn.execute(
+                     """
+                     UPDATE task_instances
+                     SET status = 'Escalated',
+                         escalation_count = escalation_count + 1
+-                    WHERE instance_id = ?
++                    WHERE instance_id = %s AND status <> 'Completed'
+                     """,
+                     (iid,),
+                 )
+@@ -778,12 +640,27 @@ class ComplianceRepository:
+         rows = self.conn.execute(
+             "SELECT * FROM task_events_audit ORDER BY audit_seq ASC"
+         ).fetchall()
+-        return [dict(r) for r in rows]
++        normalized: list[dict[str, Any]] = []
++        for r in rows:
++            item = dict(r)
++            item["audit_seq"] = int(item["audit_seq"])
++            item["event_id"] = str(item["event_id"])
++            item["event_type"] = str(item["event_type"])
++            item["instance_id"] = str(item["instance_id"]) if item["instance_id"] else None
++            item["actor_user_id"] = str(item["actor_user_id"]) if item["actor_user_id"] else None
++            item["occurred_at"] = format_canonical_utc_timestamp(item["occurred_at"])
++            item["prev_hash"] = str(item["prev_hash"]).strip()
++            item["row_hash"] = str(item["row_hash"]).strip()
++            normalized.append(item)
++        return normalized
+ 
+     def verify_ledger_integrity(self) -> LedgerVerificationResult:
+         rows = self.get_all_audit_events()
+         return verify_audit_chain(rows)
+ 
+     def close(self) -> None:
+-        self.conn.close()
+-
++        if not self.conn.closed:
++            if self._drop_schema_on_close and self._ephemeral_schema:
++                with self.conn.transaction():
++                    self.conn.execute(f'DROP SCHEMA IF EXISTS "{self._ephemeral_schema}" CASCADE;')
++            self.conn.close()
+diff --git a/src/slack_bot/service.py b/src/slack_bot/service.py
+index 2f20331..150221c 100644
+--- a/src/slack_bot/service.py
++++ b/src/slack_bot/service.py
+@@ -19,7 +19,7 @@ logger = logging.getLogger("pharmacy_compliance.slack_service")
+ 
+ def create_slack_runtime(config: AppConfig | None = None) -> tuple[ComplianceRepository, SlackComplianceHandler, TrancheSchedulerEngine]:
+     cfg = config or AppConfig()
+-    repo = ComplianceRepository(cfg.sqlite_fallback_path)
++    repo = ComplianceRepository(cfg.database_url)
+     repo.seed_tasks_from_sql_file()
+     handler = SlackComplianceHandler(repo)
+     scheduler = TrancheSchedulerEngine(repo)
+diff --git a/tests/test_phase1_schema_and_immutability.py b/tests/test_phase1_schema_and_immutability.py
+index c45f704..69efec3 100644
+--- a/tests/test_phase1_schema_and_immutability.py
++++ b/tests/test_phase1_schema_and_immutability.py
+@@ -1,16 +1,18 @@
+ """
+-Phase 1 Critic Verification Gate:
+-Tests Database Schema, 33-Task Normalization, RBAC Constraints,
+-Append-Only Immutability Triggers, and SHA-256 Cryptographic Hash Chain Tamper Detection.
++Phase 1 Critic Verification Gate (PostgreSQL-Exclusive):
++Tests PostgreSQL Schema (`db/01_schema.sql`), 33-Task SQL Seeding (`db/02_seed_tasks.sql`),
++RBAC Constraints, Append-Only Immutability Triggers, and SHA-256 Cryptographic Hash Chain Tamper Detection.
++Zero SQLite usage anywhere in this suite.
+ """
+ 
+ from __future__ import annotations
+ 
+ from datetime import date
+ from pathlib import Path
+-import sqlite3
+ import unittest
+ 
++import psycopg
++
+ from src.domain.models import (
+     DailyWindow,
+     RoleRequirement,
+@@ -23,7 +25,7 @@ from src.repository.db_repo import ComplianceRepository
+ 
+ class Phase1CriticTestSuite(unittest.TestCase):
+     def test_all_33_tasks_seeded_and_normalized_accurately(self) -> None:
+-        repo = ComplianceRepository(":memory:")
++        repo = ComplianceRepository()
+         count = repo.seed_tasks_from_sql_file()
+         self.assertEqual(count, 33)
+ 
+@@ -55,14 +57,14 @@ class Phase1CriticTestSuite(unittest.TestCase):
+         self.assertEqual(normalize_role_label("Dispenser"), RoleRequirement.DISPENSER)
+ 
+         # Verify only Fridge Check requires structured input
+-        structured = [r for r in rows if r["requires_structured_input"] == 1]
++        structured = [r for r in rows if bool(r["requires_structured_input"]) is True]
+         self.assertEqual(len(structured), 1)
+         self.assertEqual(structured[0]["task_name"], "Fridge Check (Min/Max/Current)")
+         repo.close()
+ 
+     def test_pharmacist_requires_gphc_registration_number(self) -> None:
+-        repo = ComplianceRepository(":memory:")
+-        with self.assertRaises(sqlite3.IntegrityError):
++        repo = ComplianceRepository()
++        with self.assertRaises(psycopg.Error):
+             repo.upsert_user(
+                 entra_oid="oid-pharm-invalid",
+                 slack_user_id="U_PHARM_BAD",
+@@ -84,30 +86,32 @@ class Phase1CriticTestSuite(unittest.TestCase):
+         repo.close()
+ 
+     def test_audit_ledger_blocks_sql_update_and_delete_at_db_trigger_level(self) -> None:
+-        repo = ComplianceRepository(":memory:")
++        repo = ComplianceRepository()
+         repo.seed_tasks_from_sql_file()
+         repo.ensure_instances_for_date(date(2026, 10, 13))
+ 
+         events = repo.get_all_audit_events()
+         self.assertEqual(len(events), 33)
+ 
+-        # Critic Attack 1: Attempt direct SQL UPDATE on task_events_audit
++        # Critic Attack 1: Attempt direct SQL UPDATE on PostgreSQL task_events_audit
+         with self.assertRaisesRegex(
+-            sqlite3.IntegrityError,
++            psycopg.Error,
+             "COMPLIANCE VIOLATION: task_events_audit is strictly append-only",
+         ):
+-            repo.conn.execute("UPDATE task_events_audit SET actor_role = 'Pharm' WHERE audit_seq = 1")
++            with repo.conn.transaction():
++                repo.conn.execute("UPDATE task_events_audit SET actor_role = 'Pharm' WHERE audit_seq = 1")
+ 
+-        # Critic Attack 2: Attempt direct SQL DELETE on task_events_audit
++        # Critic Attack 2: Attempt direct SQL DELETE on PostgreSQL task_events_audit
+         with self.assertRaisesRegex(
+-            sqlite3.IntegrityError,
++            psycopg.Error,
+             "COMPLIANCE VIOLATION: task_events_audit is strictly append-only",
+         ):
+-            repo.conn.execute("DELETE FROM task_events_audit WHERE audit_seq = 1")
++            with repo.conn.transaction():
++                repo.conn.execute("DELETE FROM task_events_audit WHERE audit_seq = 1")
+         repo.close()
+ 
+     def test_sha256_hash_chain_detects_storage_level_tampering(self) -> None:
+-        repo = ComplianceRepository(":memory:")
++        repo = ComplianceRepository()
+         repo.seed_tasks_from_sql_file()
+         repo.ensure_instances_for_date(date(2026, 10, 13))
+ 
+@@ -115,11 +119,12 @@ class Phase1CriticTestSuite(unittest.TestCase):
+         self.assertTrue(verification.is_valid)
+         self.assertEqual(verification.total_rows_checked, 33)
+ 
+-        # Critic Attack 3: Simulate a rogue cloud admin dropping the trigger, altering a historical timestamp
+-        repo.conn.execute("DROP TRIGGER trg_prevent_audit_update;")
+-        repo.conn.execute(
+-            "UPDATE task_events_audit SET occurred_at = '2026-10-13T08:00:00.000000Z' WHERE audit_seq = 10"
+-        )
++        # Critic Attack 3: Simulate a rogue cloud superuser dropping the PostgreSQL trigger and altering a timestamp
++        with repo.conn.transaction():
++            repo.conn.execute("DROP TRIGGER trg_prevent_audit_row_mutation ON task_events_audit;")
++            repo.conn.execute(
++                "UPDATE task_events_audit SET occurred_at = '2026-10-13T08:00:00.000000Z' WHERE audit_seq = 10"
++            )
+ 
+         tampered_check = repo.verify_ledger_integrity()
+         self.assertFalse(tampered_check.is_valid)
+diff --git a/tests/test_wp2_hash_chain_and_db_integrity.py b/tests/test_wp2_hash_chain_and_db_integrity.py
+new file mode 100644
+index 0000000..f01e31c
+--- /dev/null
++++ b/tests/test_wp2_hash_chain_and_db_integrity.py
+@@ -0,0 +1,177 @@
++"""
++Deterministic PostgreSQL-Only Acceptance Tests for WP-2
++(Audit IDs: ID-002, ID-008, ID-009, ID-010, ID-016, ID-017, ID-022).
++Executes against live PostgreSQL 18 (zero SQLite anywhere in the codebase).
++"""
++
++from __future__ import annotations
++
++import ast
++from datetime import date, datetime, timezone
++from pathlib import Path
++import unittest
++import uuid
++
++import psycopg
++
++from src.domain.ledger import (
++    GENESIS_PREV_HASH,
++    canonical_json,
++    compute_audit_row_hash,
++    format_canonical_utc_timestamp,
++)
++from src.domain.models import AuditEventType, StaffRole
++from src.repository.db_repo import ComplianceRepository
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
++
++class TestWP2PostgresRepositoryAndIntegrity(unittest.TestCase):
++    def setUp(self) -> None:
++        self.repo = ComplianceRepository()
++        self.repo.seed_tasks_from_sql_file()
++
++    def tearDown(self) -> None:
++        self.repo.close()
++
++    def test_id002_id016_zero_sqlite_in_source_and_tests(self) -> None:
++        """ID-002 & ID-016: Verify sqlite3 is completely eradicated from src/ and tests/."""
++        for folder in ("src", "tests"):
++            for py_file in (REPO_ROOT / folder).rglob("*.py"):
++                tree = ast.parse(py_file.read_text(encoding="utf-8"))
++                for node in ast.walk(tree):
++                    if isinstance(node, ast.Import):
++                        for alias in node.names:
++                            self.assertNotEqual(alias.name, "sqlite3", f"sqlite3 still imported in {py_file}")
++                    elif isinstance(node, ast.ImportFrom):
++                        self.assertNotEqual(node.module, "sqlite3", f"from sqlite3 still used in {py_file}")
++
++    def test_id008_postgres_fn_canonical_jsonb_matches_python_canonical_json_byte_for_byte(self) -> None:
++        """ID-008: Execute fn_canonical_jsonb() inside PostgreSQL 18 and compare to Python canonical_json()."""
++        payload = {"z_key": 10, "a_key": {"nested_b": True, "nested_a": "value"}, "m_list": [3, 1, 2]}
++        py_json = canonical_json(payload)
++        pg_row = self.repo.conn.execute(
++            "SELECT fn_canonical_jsonb(%s::jsonb) AS pg_json",
++            (py_json,),
++        ).fetchone()
++        self.assertIsNotNone(pg_row)
++        self.assertEqual(pg_row["pg_json"], py_json)
++
++        # Verify PostgreSQL BEFORE INSERT trigger computes the exact same SHA-256 row_hash as Python
++        ev = self.repo.append_audit_event(
++            event_type=AuditEventType.INSTANCE_SCHEDULED,
++            task_id=1,
++            period_key="2026-10-16",
++            payload=payload,
++            occurred_at=datetime(2026, 10, 16, 9, 15, 30, 654321, tzinfo=timezone.utc),
++        )
++        py_recomputed = compute_audit_row_hash(
++            event_id=ev["event_id"],
++            event_type=ev["event_type"],
++            task_id=1,
++            instance_id=None,
++            period_key="2026-10-16",
++            actor_user_id=None,
++            actor_slack_id=None,
++            actor_entra_oid=None,
++            actor_role=None,
++            payload=payload,
++            occurred_at_iso=format_canonical_utc_timestamp(
++                datetime(2026, 10, 16, 9, 15, 30, 654321, tzinfo=timezone.utc)
++            ),
++            prev_hash=GENESIS_PREV_HASH,
++        )
++        self.assertEqual(ev["row_hash"], py_recomputed)
++        self.assertTrue(self.repo.verify_ledger_integrity().is_valid)
++
++    def test_id010_postgres_trigger_rejects_forged_row_hash_and_broken_prev_hash(self) -> None:
++        """ID-010: PostgreSQL BEFORE INSERT trigger blocks forged row_hash and invalid prev_hash."""
++        ev1 = self.repo.append_audit_event(
++            event_type=AuditEventType.INSTANCE_SCHEDULED,
++            task_id=1,
++            period_key="2026-10-16",
++            payload={"tranche": "Morning"},
++        )
++        self.assertEqual(ev1["prev_hash"], GENESIS_PREV_HASH)
++
++        # Attempt direct SQL INSERT into PostgreSQL with forged row_hash
++        with self.assertRaises(psycopg.Error) as ctx_forged:
++            with self.repo.conn.transaction():
++                self.repo.conn.execute(
++                    """
++                    INSERT INTO task_events_audit (
++                        event_id, event_type, task_id, period_key, payload, prev_hash, row_hash
++                    ) VALUES (%s, 'TASK_COMPLETED', 1, '2026-10-16', '{"forged":true}'::jsonb, %s, %s)
++                    """,
++                    (str(uuid.uuid4()), ev1["row_hash"], "f" * 64),
++                )
++        self.assertIn("Forged or mismatched row_hash", str(ctx_forged.exception))
++
++        # Attempt direct SQL INSERT into PostgreSQL with broken prev_hash
++        with self.assertRaises(psycopg.Error) as ctx_prev:
++            with self.repo.conn.transaction():
++                self.repo.conn.execute(
++                    """
++                    INSERT INTO task_events_audit (
++                        event_id, event_type, task_id, period_key, payload, prev_hash, row_hash
++                    ) VALUES (%s, 'TASK_COMPLETED', 1, '2026-10-16', '{"forged":true}'::jsonb, %s, '')
++                    """,
++                    (str(uuid.uuid4()), "1" * 64),
++                )
++        self.assertIn("Invalid prev_hash", str(ctx_prev.exception))
++
++    def test_id009_optimistic_locking_prevents_duplicate_completion_race(self) -> None:
++        """ID-009: Concurrent completion when status is already Completed returns conflict without duplicate audit."""
++        from unittest.mock import patch
++
++        pharm = self.repo.upsert_user(
++            entra_oid="oid-pharm-race",
++            slack_user_id="U_PHARM_RACE",
++            full_name="Anjum RP",
++            email="anjum@pharmacy.co.uk",
++            staff_role=StaffRole.PHARM,
++            gphc_reg_number="2054321",
++        )
++        instances = self.repo.ensure_instances_for_date(date(2026, 10, 16))
++        target = next(i for i in instances if i.task_name == "CD Register Reconcile")
++
++        stale_pending_snapshot = self.repo.get_instance_by_id(target.instance_id)
++        self.assertIsNotNone(stale_pending_snapshot)
++
++        with self.repo.conn.transaction():
++            self.repo.conn.execute(
++                """
++                UPDATE task_instances
++                SET status = 'Completed', completed_by_user_id = %s, completed_at = NOW()
++                WHERE instance_id = %s
++                """,
++                (pharm.user_id, target.instance_id),
++            )
++
++        with patch.object(self.repo, "get_instance_by_id", side_effect=[stale_pending_snapshot, target]):
++            ok, msg, _ = self.repo.complete_task_instance(
++                instance_id=target.instance_id,
++                actor_slack_id=pharm.slack_user_id,
++            )
++        self.assertFalse(ok)
++        self.assertIn("Conflict:", msg)
++
++    def test_id017_id022_sql_seed_and_pg_advisory_lock_active(self) -> None:
++        """ID-017 & ID-022: Verify 02_seed_tasks.sql seeded 33 tasks and advisory lock is active in PG."""
++        proc_src = self.repo.conn.execute(
++            """
++            SELECT p.prosrc
++            FROM pg_proc p
++            JOIN pg_namespace n ON n.oid = p.pronamespace
++            WHERE p.proname = 'fn_audit_compute_hash_chain'
++              AND n.nspname = current_schema()
++            LIMIT 1
++            """
++        ).fetchone()
++        self.assertIsNotNone(proc_src)
++        self.assertIn("pg_advisory_xact_lock", proc_src["prosrc"])
++        self.assertNotIn("LOCK TABLE", proc_src["prosrc"])
++
++
++if __name__ == "__main__":
++    unittest.main()

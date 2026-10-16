@@ -1,0 +1,48 @@
+{
+  "packet_id": "WP-2_attempt_1",
+  "task_id": "WP-2",
+  "audit_ids": [
+    "ID-002",
+    "ID-008",
+    "ID-009",
+    "ID-010",
+    "ID-016",
+    "ID-017",
+    "ID-022"
+  ],
+  "attempt": 1,
+  "timestamp_utc": "2026-10-16T12:10:55.893697+00:00",
+  "git_base_ref": "8d5eba1ab90669d6d0da8b889f7d0e4f5818e1c0",
+  "file_hashes_sha256": {
+    ".env.example": "afe7317cc60ab256d5b11cd4bf408ed7d0d50431c29e04cda0e86a85b101e323",
+    "db/01_schema.sql": "ca81a4e33f04683ddeab88bc813f1b26648b778a35ec24292b9cde14b14da744",
+    "src/backup/archive_and_verify.py": "9bb8f435eaec67993d4a2a485d17558b46612296b0e65f31e3e9b46455f5d51c",
+    "src/backup/service.py": "fb1d5a698fe1eaecae41e9767e9e7727a88537bb66cf2ffd81417fcca792d137",
+    "src/config.py": "f8462e888f364b688156f573d9ebb5b294dc8060de64db36dcc4f23ed7c33cc9",
+    "src/dashboard/app.py": "20c00f30ca7705498174c5c2d3779d866fa56ece7442810f6979a9ce37691ecf",
+    "src/domain/ledger.py": "a859a8e31eab35e80678aab87a3d4e5196ef4f444c31f7780fb6595cc7881f07",
+    "src/repository/db_repo.py": "acba8610167bcb9453d12340a4f393bd0c93c396fd3d9329814a98888b0d889c",
+    "src/slack_bot/service.py": "2d9dbdf93008cd74208301bd4a1218e308fba33e4264776a898806633322544f",
+    "tests/test_phase1_schema_and_immutability.py": "b6ac856eb538fc13c8846f60790402a26d96b3066791cbed0b8bb7d26e4473ba",
+    "tests/test_wp2_hash_chain_and_db_integrity.py": "d16de568172d56111b991c618cb9b68f9cea1d5a4eed7767490a8c31086190b3"
+  },
+  "patch_sha256": "d825b328abd084eef02e6c4ca979b1cc13ebb982e312e2f23608869e58fba1bc",
+  "gate_exit_codes": {
+    "ruff": 0,
+    "pytest_suite": 0,
+    "bandit": 0,
+    "pip_audit": 0,
+    "secret_scanner_gate": 0
+  },
+  "acceptance_exit_codes": {
+    "tests/test_wp2_hash_chain_and_db_integrity.py": 0,
+    "tests/test_phase1_schema_and_immutability.py": 0,
+    "tests/test_phase2_slack_rbac_and_scheduler.py": 0,
+    "tests/test_phase3_entra_and_dashboard_exports.py": 0,
+    "tests/test_phase4_backup_and_break_glass.py": 0,
+    "tests/test_phase5_end_to_end_workflow.py": 0
+  },
+  "critic_attestation_valid": true,
+  "critic_advisory_findings": [],
+  "packet_sha256": "a699db8a11737bd329b2f27b8735b96b1d21f33d7bf0180a94d4dc95dd2b00d7"
+}

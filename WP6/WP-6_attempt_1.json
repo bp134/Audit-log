@@ -1,0 +1,36 @@
+{
+  "packet_id": "WP-6_attempt_1",
+  "task_id": "WP-6",
+  "audit_ids": [
+    "ID-015",
+    "ID-026",
+    "ID-027"
+  ],
+  "attempt": 1,
+  "timestamp_utc": "2026-10-16T19:01:21.916400+00:00",
+  "git_base_ref": "1d075ea632b215e44599a107885cb4b85b4ec59d",
+  "file_hashes_sha256": {
+    ".github/workflows/ci.yml": "5abd67a049d5d480dfc948996462ceb8f384efef26bce9b9b55abb8d3d9ebf4e",
+    "README.md": "1d871733931a1e97b30a6ce2f3db9c6358fef6b82ec0bcfdb3ae75e033bb97ba",
+    "docker-compose.yml": "a7ca2abcb6cfe930dba1e93ee54aab38b8c6a47c0799566692e7b167c2883667",
+    "requirements.txt": "595be4d41b4c6d17a7fe0acdc3dc9ac4825dd4d58b9a2ebefa0bb64d33fca25a",
+    "src/backup/service.py": "9d6440f4e40861c43319a89a8f3ffd8d12ab59efb651539df8e537598fcbf975",
+    "src/slack_bot/service.py": "ae5a650e6d630ae7ecca8b609d017468c290641deea02dae80f2703d92566be0",
+    "tests/test_wp6_health_cicd_and_docs.py": "a22046020fec681c939196f8a6e8ddbd6f1acaa79b4bf67bb30e98d487156bc7"
+  },
+  "patch_sha256": "fccf7284d2f8412a45db88d161de20975d10e436eda18925b7ae543275cb7053",
+  "gate_exit_codes": {
+    "ruff": 0,
+    "pytest_suite": 0,
+    "bandit": 0,
+    "pip_audit": 0,
+    "secret_scanner_gate": 0
+  },
+  "acceptance_exit_codes": {
+    "tests/test_wp6_health_cicd_and_docs.py": 0,
+    "tests/test_phase5_end_to_end_workflow.py": 0
+  },
+  "critic_attestation_valid": true,
+  "critic_advisory_findings": [],
+  "packet_sha256": "bfac1437164f685309434fad38376746a00f7331fd72b00026c7cbf2ee3c417e"
+}

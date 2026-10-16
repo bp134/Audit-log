@@ -1,0 +1,135 @@
+{
+  "plan_hash": "f3708bb8cfa866b7ffd029469164ff9b663ab414438c6fbfa3548ba18e4a753c",
+  "git_head_sha": "481652e251fbc122c2627b7304a610be03a4cd0f",
+  "git_write_tree_sha": "95be870d7c27340cb7c6d202f23a31353303f8ba",
+  "porcelain_sha256": "d3bafcce0a18edbd57361fd8bc10c7d4b689ea27db9834077ae57cff332352a6",
+  "task_outcomes": {
+    "WP-1": "promoted",
+    "WP-2": "promoted",
+    "WP-3": "promoted",
+    "WP-4": "promoted",
+    "WP-5": "promoted",
+    "WP-6": "promoted"
+  },
+  "approved_evidence_packets": [
+    "f23f27c933310d4d8a68db8226b0ad670c5d3763646b6b66fefdd2e00e5e33f9",
+    "a699db8a11737bd329b2f27b8735b96b1d21f33d7bf0180a94d4dc95dd2b00d7",
+    "c26c03229e1f82b0a1dfca66f6af3982fc9c84ed2b9b8a053f2ed6edab9aef82",
+    "f3c237b7e8a2612fd5bd38eef9fbb30541fed66c79955aa4ab13e3bc0c693ead",
+    "770e6609f21544967ea55bce96af361151248f6264759df1e6581335186edb94",
+    "bfac1437164f685309434fad38376746a00f7331fd72b00026c7cbf2ee3c417e"
+  ],
+  "break_glass_overrides": [],
+  "tainted_release": false,
+  "final_gate_exit_codes": {
+    "ruff": 0,
+    "pytest_suite": 0,
+    "bandit": 0,
+    "pip_audit": 0,
+    "secret_scanner_gate": 0,
+    "break_glass_staging_mutation_drill": 0
+  },
+  "release_bundle_hash": "560ab1cb669141141faf5fc98fc893c9ea77073714de67500c00febebb708fa9",
+  "gate_results": [
+    {
+      "gate": "ruff",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "ruff",
+        "check",
+        "--select",
+        "E9,F63,F7,F82",
+        "src",
+        "tests"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log",
+      "timestamp_utc": "2026-10-16T19:08:39.419913+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": "All checks passed!\n",
+      "stderr": ""
+    },
+    {
+      "gate": "pytest_suite",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "pytest",
+        "-q",
+        "tests"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log",
+      "timestamp_utc": "2026-10-16T19:09:01.906715+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": ".........................................                                [100%]\n41 passed in 20.55s\n",
+      "stderr": ""
+    },
+    {
+      "gate": "bandit",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "bandit",
+        "-q",
+        "-r",
+        "src/"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log",
+      "timestamp_utc": "2026-10-16T19:09:03.339883+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "gate": "pip_audit",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "pip_audit",
+        "-r",
+        "requirements.txt",
+        "--no-deps",
+        "--progress-spinner",
+        "off"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log",
+      "timestamp_utc": "2026-10-16T19:09:50.012597+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "WARNING:pip_audit._cli:--no-deps is supported, but users are encouraged to fully hash their pinned dependencies\nWARNING:pip_audit._cli:Consider using a tool like `pip-compile`: https://pip-tools.readthedocs.io/en/latest/#using-hashes\nNo known vulnerabilities found\n"
+    },
+    {
+      "gate": "secret_scanner_gate",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-c",
+        "import pathlib, re, sys; pat = re.compile(r'(AKIA[0-9A-Z]{16}|xox[baprs]-[0-9]{10,}|-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----)'); hits = [f'{p}:{m.group(0)}' for p in pathlib.Path('src').rglob('*.py') for m in pat.finditer(p.read_text(encoding='utf-8'))]; print('\\n'.join(hits)); sys.exit(1 if hits else 0)"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log",
+      "timestamp_utc": "2026-10-16T19:09:50.144565+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": "\n",
+      "stderr": ""
+    },
+    {
+      "gate": "break_glass_staging_mutation_drill",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "unittest",
+        "tests/test_phase4_backup_and_break_glass.py"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log",
+      "timestamp_utc": "2026-10-16T19:09:53.625948+00:00",
+      "read_only": false,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "..\n----------------------------------------------------------------------\nRan 2 tests in 2.002s\n\nOK\n"
+    }
+  ]
+}

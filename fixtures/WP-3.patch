@@ -1,0 +1,933 @@
+diff --git a/db/01_schema.sql b/db/01_schema.sql
+index 5c6c551..6cd282e 100644
+--- a/db/01_schema.sql
++++ b/db/01_schema.sql
+@@ -23,7 +23,7 @@ BEGIN
+     END IF;
+ 
+     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'staff_role' AND n.nspname = current_schema()) THEN
+-        CREATE TYPE staff_role AS ENUM ('Pharm', 'Dispenser', 'Manager');
++        CREATE TYPE staff_role AS ENUM ('Pharm', 'PT', 'Dispenser', 'MCA', 'Manager');
+     END IF;
+ 
+     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'role_requirement' AND n.nspname = current_schema()) THEN
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 2221b57..a30b915 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -11,15 +11,15 @@ services:
+     volumes:
+       - compliance_data:/app/data
+ 
+-  # 2. Entra ID Compliance & GPhC Inspection Dashboard (Streamlit UI)
++  # 2. Entra ID Compliance & GPhC Inspection Dashboard (Streamlit UI — ID-007: bound to 127.0.0.1 for reverse-proxy TLS termination)
+   compliance-dashboard:
+     build: .
+     container_name: pharmacy_compliance_dashboard
+     restart: unless-stopped
+     env_file: .env
+     ports:
+-      - "8501:8501"
+-    command: streamlit run src/dashboard/app.py --server.port=8501 --server.address=0.0.0.0
++      - "127.0.0.1:8501:8501"
++    command: streamlit run src/dashboard/app.py --server.port=8501 --server.address=0.0.0.0 --server.enableCORS=true --server.enableXsrfProtection=true
+     volumes:
+       - compliance_data:/app/data
+ 
+diff --git a/requirements.txt b/requirements.txt
+index 3e367aa..a318c72 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,3 +5,5 @@ APScheduler==3.10.4
+ streamlit==1.61.1
+ boto3==1.35.90
+ msal==1.39.0
++PyJWT==2.15.1
++cryptography==50.0.2
+diff --git a/src/dashboard/app.py b/src/dashboard/app.py
+index 65a3914..bc25ed7 100644
+--- a/src/dashboard/app.py
++++ b/src/dashboard/app.py
+@@ -1,14 +1,17 @@
+ """
+ Streamlit Compliance & GPhC Inspection Dashboard (`src/dashboard/app.py`).
+-Designed for maximum ease of use with zero manual SQL queries required.
+-Run with: `streamlit run src/dashboard/app.py`
++- ID-001: Enforces verified Microsoft Entra ID OIDC session before rendering; staff impersonation picker removed.
++- ID-011: Enforces GPhC clinical role permissions (`Pharm`, `PT`, `Dispenser`, `MCA`) vs read-only `Manager` oversight.
++- ID-012 & ID-028: Restricts forensic audit tab to authorized roles (`Pharm`, `Manager`) and redacts sensitive identifiers.
+ """
+ 
+ from __future__ import annotations
+ 
+-from datetime import date, datetime, timezone
+-import sys
++from datetime import datetime, timezone
+ from pathlib import Path
++import sys
++from typing import Any
++import uuid
+ 
+ # Ensure project root is on sys.path when launched via `streamlit run`
+ PROJECT_ROOT = Path(__file__).resolve().parents[2]
+@@ -16,15 +19,121 @@ if str(PROJECT_ROOT) not in sys.path:
+     sys.path.insert(0, str(PROJECT_ROOT))
+ 
+ from src.config import AppConfig
++from src.dashboard.auth import EntraIDAuthenticator
+ from src.dashboard.reporting import (
+     build_dashboard_summary,
+     export_inspection_csv,
+     generate_daily_compliance_report_markdown,
+ )
+-from src.domain.models import DailyWindow, InstanceStatus, StaffRole, TaskFrequency
++from src.domain.models import (
++    DailyWindow,
++    InstanceStatus,
++    StaffRole,
++    TaskFrequency,
++    UserRecord,
++    can_complete_clinical_tasks,
++    can_view_audit_and_rota_oversight,
++    is_role_authorized,
++)
+ from src.repository.db_repo import ComplianceRepository
+ 
+ 
++def redact_audit_event_for_ui(event: dict[str, Any], viewer_role: StaffRole) -> dict[str, Any]:
++    """
++    ID-012 & ID-028: Redacts sensitive identifiers and raw credentials from audit rows
++    displayed in the UI based on the viewer's role.
++    """
++    redacted = dict(event)
++    payload = dict(redacted.get("payload") or {})
++    payload.pop("gphc_reg_number", None)
++    payload.pop("email", None)
++    redacted["payload"] = payload
++
++    if viewer_role != StaffRole.PHARM:
++        slack_id = str(redacted.get("actor_slack_id") or "")
++        if slack_id:
++            redacted["actor_slack_id"] = f"{slack_id[:4]}***"
++        entra_oid = str(redacted.get("actor_entra_oid") or "")
++        if entra_oid:
++            redacted["actor_entra_oid"] = f"{entra_oid[:8]}***"
++    return redacted
++
++
++def _resolve_authenticated_entra_user(
++    st_mod: Any, cfg: AppConfig, repo: ComplianceRepository
++) -> UserRecord | None:
++    """
++    ID-001: Resolves the signed-in user strictly from a verified Microsoft Entra ID OIDC session.
++    Never offers a staff profile picker dropdown.
++    """
++    authenticator = EntraIDAuthenticator(
++        repo=repo,
++        expected_tenant_id=cfg.entra_tenant_id,
++        expected_client_id=cfg.entra_client_id,
++        client_secret=cfg.entra_client_secret,
++    )
++
++    session_claims = st_mod.session_state.get("entra_oidc_claims")
++    expected_nonce = st_mod.session_state.get("entra_oidc_nonce")
++    if isinstance(session_claims, dict):
++        auth_res = authenticator.verify_oidc_claims(
++            session_claims,
++            expected_nonce=expected_nonce,
++            verify_temporal_claims=True,
++        )
++        if auth_res.authenticated and auth_res.user:
++            return auth_res.user
++        st_mod.error(auth_res.error_message or "Entra ID session verification failed.")
++        return None
++
++    # Handle Microsoft Entra ID OAuth2/OIDC callback (`?code=...`) or bearer token (`?id_token=...`)
++    query_params = getattr(st_mod, "query_params", {})
++    auth_code = query_params.get("code") if hasattr(query_params, "get") else None
++    raw_id_token = query_params.get("id_token") if hasattr(query_params, "get") else None
++
++    if auth_code:
++        auth_res, verified_claims = authenticator.exchange_authorization_code(
++            str(auth_code),
++            redirect_uri=cfg.entra_redirect_uri,
++            expected_nonce=expected_nonce,
++        )
++        if auth_res.authenticated and auth_res.user and verified_claims:
++            st_mod.session_state["entra_oidc_claims"] = verified_claims
++            if hasattr(query_params, "clear"):
++                query_params.clear()
++            return auth_res.user
++        st_mod.error(auth_res.error_message or "Microsoft Entra ID code exchange failed.")
++        st_mod.stop()
++        return None
++
++    if raw_id_token:
++        jwks_doc = authenticator.fetch_tenant_jwks()
++        auth_res = authenticator.verify_id_token(
++            str(raw_id_token),
++            jwks_document=jwks_doc,
++            expected_nonce=expected_nonce,
++        )
++        if auth_res.authenticated and auth_res.user:
++            return auth_res.user
++        st_mod.error(auth_res.error_message or "Microsoft Entra ID token verification failed.")
++        st_mod.stop()
++        return None
++
++    # Render Microsoft Entra ID SSO sign-in gate and halt page execution
++    st_mod.title("🔐 Pharmacy Compliance & GPhC Audit Dashboard")
++    st_mod.warning("Authentication Required: Please sign in with your Microsoft Entra ID corporate account.")
++    if "entra_oidc_nonce" not in st_mod.session_state:
++        st_mod.session_state["entra_oidc_nonce"] = str(uuid.uuid4())
++    auth_url = authenticator.build_msal_authorization_url(
++        nonce=st_mod.session_state["entra_oidc_nonce"],
++        redirect_uri=cfg.entra_redirect_uri,
++    )
++    if auth_url:
++        st_mod.link_button("🔑 Sign in with Microsoft Entra ID (SSO)", auth_url)
++    st_mod.stop()
++    return None
++
++
+ def render_streamlit_dashboard() -> None:
+     import streamlit as st
+ 
+@@ -56,17 +165,20 @@ def render_streamlit_dashboard() -> None:
+             staff_role=StaffRole.DISPENSER,
+         )
+ 
++    active_user = _resolve_authenticated_entra_user(st, cfg, repo)
++    if active_user is None:
++        return
++
+     st.title("⚕️ Pharmacy Operations & GPhC Compliance Dashboard")
+     st.caption(
+         "Immutable SHA-256 Audit Ledger • Entra ID RBAC Enforced • Zero-Query Inspection View"
+     )
+ 
+     with st.sidebar:
+-        st.header("🔐 Entra ID Session & Controls")
+-        users = repo.list_users()
+-        user_labels = {f"{u.full_name} [{u.staff_role.value}]": u for u in users}
+-        selected_label = st.selectbox("Signed-in Staff Profile (Entra SSO)", list(user_labels.keys()))
+-        active_user = user_labels[selected_label]
++        st.header("🔐 Verified Entra ID Session")
++        st.markdown(f"**Signed-in User:** {active_user.full_name}")
++        st.markdown(f"**GPhC / Staff Role:** `{active_user.staff_role.value}`")
++        st.markdown(f"**Entra Object ID:** `{active_user.entra_oid[:12]}...`")
+ 
+         selected_date = st.date_input(
+             "Operating Date",
+@@ -136,6 +248,7 @@ def render_streamlit_dashboard() -> None:
+     )
+ 
+     instances = repo.ensure_instances_for_date(selected_date)
++    user_can_act = can_complete_clinical_tasks(active_user.staff_role)
+ 
+     with tab_daily:
+         for window, title in [
+@@ -160,7 +273,11 @@ def render_streamlit_dashboard() -> None:
+                     f"Status: **{inst.status.value}**"
+                     + (f" ({inst.completed_by_name})" if inst.completed_by_name else "")
+                 )
+-                if inst.status != InstanceStatus.COMPLETED:
++                if (
++                    inst.status != InstanceStatus.COMPLETED
++                    and user_can_act
++                    and is_role_authorized(active_user.staff_role, inst.assigned_role)
++                ):
+                     if inst.requires_structured_input:
+                         with cols[3].popover("🌡️ Log Temps"):
+                             min_t = st.number_input("Min (°C)", value=3.2, step=0.1, key=f"min_{inst.instance_id}")
+@@ -206,7 +323,11 @@ def render_streamlit_dashboard() -> None:
+                     f"{icon} **{inst.task_name}** (`{inst.assigned_role.value}`)"
+                     + (f" — _Done by {inst.completed_by_name}_" if inst.completed_by_name else "")
+                 )
+-                if inst.status != InstanceStatus.COMPLETED:
++                if (
++                    inst.status != InstanceStatus.COMPLETED
++                    and user_can_act
++                    and is_role_authorized(active_user.staff_role, inst.assigned_role)
++                ):
+                     if c2.button("✓ Complete", key=f"w_{inst.instance_id}"):
+                         ok, msg, _ = repo.complete_task_instance(
+                             instance_id=inst.instance_id,
+@@ -226,7 +347,11 @@ def render_streamlit_dashboard() -> None:
+                     f"{icon} **{inst.task_name}** (`{inst.assigned_role.value}`)"
+                     + (f" — _Done by {inst.completed_by_name}_" if inst.completed_by_name else "")
+                 )
+-                if inst.status != InstanceStatus.COMPLETED:
++                if (
++                    inst.status != InstanceStatus.COMPLETED
++                    and user_can_act
++                    and is_role_authorized(active_user.staff_role, inst.assigned_role)
++                ):
+                     if c2.button("✓ Complete", key=f"m_{inst.instance_id}"):
+                         ok, msg, _ = repo.complete_task_instance(
+                             instance_id=inst.instance_id,
+@@ -239,8 +364,16 @@ def render_streamlit_dashboard() -> None:
+ 
+     with tab_audit:
+         st.subheader("🔒 Append-Only Cryptographic Audit Trail")
+-        events = repo.get_all_audit_events()
+-        st.dataframe(events, use_container_width=True)
++        if can_view_audit_and_rota_oversight(active_user.staff_role):
++            events = [
++                redact_audit_event_for_ui(e, active_user.staff_role)
++                for e in repo.get_all_audit_events()
++            ]
++            st.dataframe(events, use_container_width=True)
++        else:
++            st.info(
++                "Restricted View: Raw forensic audit trail is restricted to Responsible Pharmacist and Manager oversight roles."
++            )
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/dashboard/auth.py b/src/dashboard/auth.py
+index 7a36f49..f332968 100644
+--- a/src/dashboard/auth.py
++++ b/src/dashboard/auth.py
+@@ -1,9 +1,21 @@
+-"""Microsoft Entra ID (OIDC) authentication and RBAC session verification."""
++"""
++Microsoft Entra ID (OIDC) Cryptographic Authentication and RBAC Session Verification (`src/dashboard/auth.py`).
++- ID-004: Cryptographically verifies Microsoft Entra ID JWTs (`RS256` signature against JWKS public keys,
++  `exp`, `iss`, `aud`, and `nonce`) using `PyJWT` and `msal`.
++- Maps verified `oid` (Entra Object ID) and `tid` (Tenant ID) to active GPhC staff roles in PostgreSQL.
++"""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++import json
++import time
+ from typing import Any, Optional
++import urllib.request
++
++import jwt
++from jwt.algorithms import RSAAlgorithm
++import msal
+ 
+ from src.domain.models import AuditEventType, UserRecord
+ from src.repository.db_repo import ComplianceRepository
+@@ -18,15 +30,217 @@ class EntraAuthResult:
+ 
+ class EntraIDAuthenticator:
+     """
+-    Verifies Microsoft Entra ID OIDC token claims (`oid`, `tid`, `preferred_username`)
+-    against the configured tenant and the pharmacy's `users_rbac` table.
++    Verifies Microsoft Entra ID OIDC ID tokens (`RS256` JWT signature, `exp`, `iss`, `aud`, `nonce`)
++    and maps the verified claims (`oid`, `tid`) to the pharmacy's `users_rbac` table.
+     """
+ 
+-    def __init__(self, repo: ComplianceRepository, expected_tenant_id: str) -> None:
++    def __init__(
++        self,
++        repo: ComplianceRepository,
++        expected_tenant_id: str,
++        expected_client_id: Optional[str] = None,
++        client_secret: Optional[str] = None,
++    ) -> None:
+         self.repo = repo
+         self.expected_tenant_id = expected_tenant_id
++        self.expected_client_id = expected_client_id or ""
++        self.client_secret = client_secret or ""
++
++    @property
++    def expected_issuer(self) -> str:
++        return f"https://login.microsoftonline.com/{self.expected_tenant_id}/v2.0"
++
++    def build_msal_authorization_url(self, nonce: str, redirect_uri: str) -> str:
++        """Builds the Microsoft Entra ID OAuth2/OIDC authorization URL via MSAL."""
++        if not self.expected_tenant_id or not self.expected_client_id:
++            return ""
++        authority = f"https://login.microsoftonline.com/{self.expected_tenant_id}"
++        app = msal.ConfidentialClientApplication(
++            client_id=self.expected_client_id,
++            client_credential=self.client_secret or None,
++            authority=authority,
++        )
++        return str(
++            app.get_authorization_request_url(
++                scopes=["User.Read"],
++                redirect_uri=redirect_uri,
++                nonce=nonce,
++            )
++        )
++
++    def fetch_tenant_jwks(self) -> dict[str, Any]:
++        """Fetches the Microsoft Entra ID tenant JWKS public keys over HTTPS."""
++        jwks_url = f"https://login.microsoftonline.com/{self.expected_tenant_id}/discovery/v2.0/keys"
++        if not jwks_url.startswith("https://login.microsoftonline.com/"):
++            raise ValueError("Invalid Microsoft Entra JWKS discovery URL.")
++        req = urllib.request.Request(jwks_url, method="GET")
++        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310
++            return dict(json.loads(resp.read().decode("utf-8")))
++
++    def exchange_authorization_code(
++        self,
++        auth_code: str,
++        *,
++        redirect_uri: str,
++        expected_nonce: Optional[str] = None,
++        jwks_document: Optional[dict[str, Any]] = None,
++    ) -> tuple[EntraAuthResult, Optional[dict[str, Any]]]:
++        """
++        ID-001 & ID-004: Exchanges an OAuth2 authorization `code` with Microsoft Entra ID via MSAL,
++        extracts the raw `id_token`, and cryptographically verifies its RS256 signature against
++        the tenant JWKS before establishing an authenticated session.
++        """
++        if not auth_code or not self.expected_tenant_id or not self.expected_client_id:
++            return (
++                EntraAuthResult(
++                    authenticated=False,
++                    user=None,
++                    error_message="Access Denied: Missing Entra ID authorization code or tenant configuration.",
++                ),
++                None,
++            )
++
++        authority = f"https://login.microsoftonline.com/{self.expected_tenant_id}"
++        app = msal.ConfidentialClientApplication(
++            client_id=self.expected_client_id,
++            client_credential=self.client_secret or None,
++            authority=authority,
++        )
++        token_resp = app.acquire_token_by_authorization_code(
++            code=auth_code,
++            scopes=["User.Read"],
++            redirect_uri=redirect_uri,
++        )
++        raw_id_token = str(token_resp.get("id_token") or "").strip()
++        if not raw_id_token:
++            err_desc = str(token_resp.get("error_description") or token_resp.get("error") or "No id_token returned.")
++            self.repo.append_audit_event(
++                event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                payload={"surface": "DASHBOARD_OIDC_EXCHANGE", "reason": "MSAL_CODE_EXCHANGE_FAILED"},
++            )
++            return (
++                EntraAuthResult(
++                    authenticated=False,
++                    user=None,
++                    error_message=f"Access Denied: Microsoft Entra code exchange failed ({err_desc}).",
++                ),
++                None,
++            )
++
++        jwks_doc = jwks_document if jwks_document is not None else self.fetch_tenant_jwks()
++        auth_res = self.verify_id_token(
++            raw_id_token,
++            jwks_document=jwks_doc,
++            expected_nonce=expected_nonce,
++        )
++        verified_claims = token_resp.get("id_token_claims") if auth_res.authenticated else None
++        return auth_res, verified_claims
++
++    def verify_id_token(
++        self,
++        id_token: str,
++        *,
++        jwks_document: dict[str, Any],
++        expected_nonce: Optional[str] = None,
++    ) -> EntraAuthResult:
++        """
++        ID-004: Cryptographically validates a raw Microsoft Entra ID JWT (`id_token`)
++        against the tenant's JWKS RSA public keys, enforcing `RS256` signature,
++        `exp`, `iss`, `aud`, and `nonce` before delegating to RBAC lookup.
++        """
++        if not id_token or not id_token.strip():
++            return EntraAuthResult(
++                authenticated=False,
++                user=None,
++                error_message="Access Denied: Missing Microsoft Entra ID bearer token.",
++            )
++
++        try:
++            unverified_header = jwt.get_unverified_header(id_token)
++        except jwt.PyJWTError as exc:
++            return EntraAuthResult(
++                authenticated=False,
++                user=None,
++                error_message=f"Access Denied: Malformed JWT header ({exc}).",
++            )
+ 
+-    def verify_oidc_claims(self, claims: dict[str, Any]) -> EntraAuthResult:
++        alg = unverified_header.get("alg")
++        if alg != "RS256":
++            self.repo.append_audit_event(
++                event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                payload={"surface": "DASHBOARD_OIDC_JWT", "reason": "INVALID_JWT_ALG", "alg": str(alg)},
++            )
++            return EntraAuthResult(
++                authenticated=False,
++                user=None,
++                error_message="Access Denied: Only RS256 signed Microsoft Entra ID tokens are permitted.",
++            )
++
++        kid = unverified_header.get("kid")
++        keys = jwks_document.get("keys", [])
++        matching_jwk = next((k for k in keys if k.get("kid") == kid), None)
++        if not matching_jwk:
++            self.repo.append_audit_event(
++                event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                payload={"surface": "DASHBOARD_OIDC_JWT", "reason": "UNKNOWN_JWKS_KID", "kid": str(kid)},
++            )
++            return EntraAuthResult(
++                authenticated=False,
++                user=None,
++                error_message="Access Denied: Token signing key (kid) not found in Microsoft Entra JWKS.",
++            )
++
++        try:
++            public_key = RSAAlgorithm.from_jwk(json.dumps(matching_jwk))
++            decode_options = {
++                "require": ["exp", "iss", "aud", "tid", "oid"],
++                "verify_signature": True,
++                "verify_exp": True,
++                "verify_iss": bool(self.expected_tenant_id),
++                "verify_aud": bool(self.expected_client_id),
++            }
++            verified_claims: dict[str, Any] = jwt.decode(
++                id_token,
++                key=public_key,  # type: ignore[arg-type]
++                algorithms=["RS256"],
++                audience=self.expected_client_id if self.expected_client_id else None,
++                issuer=self.expected_issuer if self.expected_tenant_id else None,
++                options=decode_options,
++            )
++        except jwt.ExpiredSignatureError:
++            self.repo.append_audit_event(
++                event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                payload={"surface": "DASHBOARD_OIDC_JWT", "reason": "TOKEN_EXPIRED"},
++            )
++            return EntraAuthResult(
++                authenticated=False,
++                user=None,
++                error_message="Access Denied: Microsoft Entra ID token has expired.",
++            )
++        except (jwt.PyJWTError, ValueError, KeyError) as exc:
++            self.repo.append_audit_event(
++                event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                payload={"surface": "DASHBOARD_OIDC_JWT", "reason": "JWT_VERIFICATION_FAILED"},
++            )
++            return EntraAuthResult(
++                authenticated=False,
++                user=None,
++                error_message=f"Access Denied: Cryptographic JWT validation failed ({exc}).",
++            )
++
++        return self.verify_oidc_claims(
++            verified_claims,
++            expected_nonce=expected_nonce,
++            verify_temporal_claims=True,
++        )
++
++    def verify_oidc_claims(
++        self,
++        claims: dict[str, Any],
++        *,
++        expected_nonce: Optional[str] = None,
++        verify_temporal_claims: bool = False,
++    ) -> EntraAuthResult:
+         if not claims:
+             return EntraAuthResult(
+                 authenticated=False,
+@@ -34,6 +248,44 @@ class EntraIDAuthenticator:
+                 error_message="Missing Microsoft Entra ID OIDC claims.",
+             )
+ 
++        if verify_temporal_claims or "exp" in claims:
++            exp_val = claims.get("exp")
++            if exp_val is None or float(exp_val) <= time.time():
++                self.repo.append_audit_event(
++                    event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                    payload={"surface": "DASHBOARD_OIDC", "reason": "TOKEN_EXPIRED"},
++                )
++                return EntraAuthResult(
++                    authenticated=False,
++                    user=None,
++                    error_message="Access Denied: Microsoft Entra ID session token has expired.",
++                )
++
++        if self.expected_client_id and "aud" in claims:
++            if str(claims.get("aud", "")).strip() != self.expected_client_id:
++                self.repo.append_audit_event(
++                    event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                    payload={"surface": "DASHBOARD_OIDC", "reason": "AUDIENCE_MISMATCH"},
++                )
++                return EntraAuthResult(
++                    authenticated=False,
++                    user=None,
++                    error_message="Access Denied: Token audience (`aud`) does not match application client ID.",
++                )
++
++        if expected_nonce is not None:
++            token_nonce = str(claims.get("nonce", "")).strip()
++            if token_nonce != expected_nonce:
++                self.repo.append_audit_event(
++                    event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                    payload={"surface": "DASHBOARD_OIDC", "reason": "NONCE_MISMATCH"},
++                )
++                return EntraAuthResult(
++                    authenticated=False,
++                    user=None,
++                    error_message="Access Denied: OIDC replay protection `nonce` mismatch.",
++                )
++
+         token_tid = str(claims.get("tid", "")).strip()
+         if self.expected_tenant_id and token_tid != self.expected_tenant_id:
+             self.repo.append_audit_event(
+diff --git a/src/domain/models.py b/src/domain/models.py
+index 415c1bc..6343c49 100644
+--- a/src/domain/models.py
++++ b/src/domain/models.py
+@@ -23,7 +23,9 @@ class DailyWindow(str, Enum):
+ 
+ class StaffRole(str, Enum):
+     PHARM = "Pharm"
++    PHARM_TECH = "PT"
+     DISPENSER = "Dispenser"
++    MCA = "MCA"
+     MANAGER = "Manager"
+ 
+ 
+@@ -71,19 +73,36 @@ def normalize_role_label(raw_label: str) -> RoleRequirement:
+ 
+ def is_role_authorized(user_role: StaffRole, required_role: RoleRequirement) -> bool:
+     """
+-    Determines whether a user with `user_role` is permitted to complete a task requiring `required_role`.
++    ID-011: Determines whether a user with `user_role` is permitted to complete a task requiring `required_role`.
++    Per GPhC regulatory requirements:
+     - RoleRequirement.PHARM: Strictly requires a Pharmacist ('Pharm').
+-      Dispensers and non-pharmacist Managers cannot sign off RP/Pharmacist-only tasks.
+-    - RoleRequirement.DISPENSER: Can be completed by a Dispenser OR a Pharmacist covering dispensary duties.
+-    - RoleRequirement.EITHER: Can be completed by either a Pharmacist or a Dispenser.
++    - RoleRequirement.DISPENSER: Can be completed by a Pharmacist ('Pharm'), Pharmacy Technician ('PT'),
++      or Dispenser / Dispensing Assistant ('Dispenser').
++    - RoleRequirement.EITHER: Can be completed by 'Pharm', 'PT', 'Dispenser', or 'MCA' (Medicines Counter Assistant).
++    - StaffRole.MANAGER: Non-qualified management role has ZERO authority to complete clinical/pharmacy tasks
++      (managers only hold read-only oversight of rota/ledger completion unless mapped to a qualified GPhC role).
+     """
++    if user_role == StaffRole.MANAGER:
++        return False
+     if required_role == RoleRequirement.PHARM:
+         return user_role == StaffRole.PHARM
+-    if required_role in (RoleRequirement.DISPENSER, RoleRequirement.EITHER):
+-        return user_role in (StaffRole.PHARM, StaffRole.DISPENSER)
++    if required_role == RoleRequirement.DISPENSER:
++        return user_role in (StaffRole.PHARM, StaffRole.PHARM_TECH, StaffRole.DISPENSER)
++    if required_role == RoleRequirement.EITHER:
++        return user_role in (StaffRole.PHARM, StaffRole.PHARM_TECH, StaffRole.DISPENSER, StaffRole.MCA)
+     return False
+ 
+ 
++def can_complete_clinical_tasks(user_role: StaffRole) -> bool:
++    """Returns True only for qualified pharmacy roles ('Pharm', 'PT', 'Dispenser', 'MCA'), never 'Manager'."""
++    return user_role in (StaffRole.PHARM, StaffRole.PHARM_TECH, StaffRole.DISPENSER, StaffRole.MCA)
++
++
++def can_view_audit_and_rota_oversight(user_role: StaffRole) -> bool:
++    """ID-028: Restricts forensic audit trail & rota oversight tab to Pharmacist and Manager roles."""
++    return user_role in (StaffRole.PHARM, StaffRole.MANAGER)
++
++
+ @dataclass(frozen=True)
+ class PeriodBounds:
+     period_key: str
+diff --git a/src/repository/db_repo.py b/src/repository/db_repo.py
+index f460c41..abd7c46 100644
+--- a/src/repository/db_repo.py
++++ b/src/repository/db_repo.py
+@@ -573,6 +573,8 @@ class ComplianceRepository:
+             if instance.requires_structured_input
+             else AuditEventType.TASK_COMPLETED
+         )
++        # ID-012: Minimize PII in audit payloads — do not duplicate GPhC registration numbers,
++        # full names, or emails inside the JSON payload (actor_user_id and actor_entra_oid link to RBAC).
+         self.append_audit_event(
+             event_type=audit_type,
+             task_id=instance.task_id,
+@@ -584,7 +586,6 @@ class ComplianceRepository:
+                 "frequency": instance.frequency.value,
+                 "structured_data": structured_payload,
+                 "notes": notes or "",
+-                "gphc_reg_number": actor.gphc_reg_number,
+             },
+             occurred_at=ts,
+         )
+diff --git a/tests/test_wp1_secrets_and_hygiene.py b/tests/test_wp1_secrets_and_hygiene.py
+index 2883757..7ace218 100644
+--- a/tests/test_wp1_secrets_and_hygiene.py
++++ b/tests/test_wp1_secrets_and_hygiene.py
+@@ -40,7 +40,7 @@ class TestWP1SecretsAndHygiene(unittest.TestCase):
+             for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+             if line.strip() and not line.strip().startswith("#")
+         ]
+-        self.assertEqual(len(reqs), 6, f"Expected all 6 dependencies in requirements.txt, got {len(reqs)}: {reqs}")
++        self.assertGreaterEqual(len(reqs), 6, f"Expected at least 6 dependencies in requirements.txt, got {len(reqs)}: {reqs}")
+         for req in reqs:
+             self.assertIn("==", req, f"Dependency not strictly pinned: {req}")
+ 
+diff --git a/tests/test_wp3_entra_auth_and_rbac_hardening.py b/tests/test_wp3_entra_auth_and_rbac_hardening.py
+new file mode 100644
+index 0000000..d615cd9
+--- /dev/null
++++ b/tests/test_wp3_entra_auth_and_rbac_hardening.py
+@@ -0,0 +1,255 @@
++"""
++Deterministic PostgreSQL Acceptance Tests for WP-3
++(Audit IDs: ID-001, ID-004, ID-007, ID-011, ID-012, ID-028).
++"""
++
++from __future__ import annotations
++
++from datetime import date
++import json
++from pathlib import Path
++import time
++import unittest
++
++from cryptography.hazmat.primitives.asymmetric import rsa
++import jwt
++from jwt.algorithms import RSAAlgorithm
++
++from src.dashboard.app import redact_audit_event_for_ui
++from src.dashboard.auth import EntraIDAuthenticator
++from src.domain.models import (
++    RoleRequirement,
++    StaffRole,
++    can_complete_clinical_tasks,
++    can_view_audit_and_rota_oversight,
++    is_role_authorized,
++)
++from src.repository.db_repo import ComplianceRepository
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
++
++class TestWP3EntraAuthAndRBACHardening(unittest.TestCase):
++    def setUp(self) -> None:
++        self.repo = ComplianceRepository()
++        self.repo.seed_tasks_from_sql_file()
++        self.tenant_id = "11111111-2222-3333-4444-555555555555"
++        self.client_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
++        self.auth = EntraIDAuthenticator(
++            self.repo,
++            expected_tenant_id=self.tenant_id,
++            expected_client_id=self.client_id,
++        )
++        self.pharm = self.repo.upsert_user(
++            entra_oid="oid-anjum-rp-001",
++            slack_user_id="U_PHARM_ANJUM",
++            full_name="Anjum Superintendent RP",
++            email="anjum@pharmacy.co.uk",
++            staff_role=StaffRole.PHARM,
++            gphc_reg_number="2054321",
++        )
++
++    def tearDown(self) -> None:
++        self.repo.close()
++
++    def test_id001_dashboard_removes_staff_impersonation_selectbox(self) -> None:
++        app_src = (REPO_ROOT / "src" / "dashboard" / "app.py").read_text(encoding="utf-8")
++        self.assertNotIn("st.selectbox", app_src)
++        self.assertIn("_resolve_authenticated_entra_user", app_src)
++
++    def test_id004_cryptographic_jwt_rs256_signature_exp_aud_iss_nonce_validation(self) -> None:
++        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++        public_jwk = json.loads(RSAAlgorithm.to_jwk(private_key.public_key()))
++        public_jwk["kid"] = "entra-key-2026"
++        public_jwk["alg"] = "RS256"
++        jwks_doc = {"keys": [public_jwk]}
++
++        now = int(time.time())
++        valid_claims = {
++            "iss": f"https://login.microsoftonline.com/{self.tenant_id}/v2.0",
++            "aud": self.client_id,
++            "tid": self.tenant_id,
++            "oid": self.pharm.entra_oid,
++            "nonce": "nonce-998877",
++            "iat": now - 10,
++            "exp": now + 600,
++        }
++        valid_token = jwt.encode(
++            valid_claims,
++            private_key,
++            algorithm="RS256",
++            headers={"kid": "entra-key-2026"},
++        )
++
++        # 1. Valid signed RS256 token succeeds
++        ok_res = self.auth.verify_id_token(
++            valid_token,
++            jwks_document=jwks_doc,
++            expected_nonce="nonce-998877",
++        )
++        self.assertTrue(ok_res.authenticated)
++        self.assertIsNotNone(ok_res.user)
++        self.assertEqual(ok_res.user.entra_oid, self.pharm.entra_oid)  # type: ignore[union-attr]
++
++        # 2. Expired token is rejected
++        expired_claims = {**valid_claims, "exp": now - 120}
++        expired_token = jwt.encode(
++            expired_claims,
++            private_key,
++            algorithm="RS256",
++            headers={"kid": "entra-key-2026"},
++        )
++        exp_res = self.auth.verify_id_token(
++            expired_token,
++            jwks_document=jwks_doc,
++            expected_nonce="nonce-998877",
++        )
++        self.assertFalse(exp_res.authenticated)
++        self.assertIn("expired", (exp_res.error_message or "").lower())
++
++        # 3. Wrong audience (`aud`) is rejected
++        wrong_aud_claims = {**valid_claims, "aud": "wrong-client-id"}
++        wrong_aud_token = jwt.encode(
++            wrong_aud_claims,
++            private_key,
++            algorithm="RS256",
++            headers={"kid": "entra-key-2026"},
++        )
++        aud_res = self.auth.verify_id_token(
++            wrong_aud_token,
++            jwks_document=jwks_doc,
++            expected_nonce="nonce-998877",
++        )
++        self.assertFalse(aud_res.authenticated)
++
++        # 4. Wrong nonce is rejected
++        nonce_res = self.auth.verify_id_token(
++            valid_token,
++            jwks_document=jwks_doc,
++            expected_nonce="wrong-nonce",
++        )
++        self.assertFalse(nonce_res.authenticated)
++        self.assertIn("nonce", (nonce_res.error_message or "").lower())
++
++        # 5. Token signed by attacker RSA key is rejected
++        attacker_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++        forged_token = jwt.encode(
++            valid_claims,
++            attacker_key,
++            algorithm="RS256",
++            headers={"kid": "entra-key-2026"},
++        )
++        forged_res = self.auth.verify_id_token(
++            forged_token,
++            jwks_document=jwks_doc,
++            expected_nonce="nonce-998877",
++        )
++        self.assertFalse(forged_res.authenticated)
++
++    def test_id007_docker_compose_binds_dashboard_to_localhost_only(self) -> None:
++        compose_src = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
++        self.assertIn("127.0.0.1:8501:8501", compose_src)
++        self.assertNotIn('- "8501:8501"', compose_src)
++
++    def test_id011_gphc_roles_and_manager_readonly_policy_enforced_in_postgres(self) -> None:
++        pt_user = self.repo.upsert_user(
++            entra_oid="oid-pt-01",
++            slack_user_id="U_PT_01",
++            full_name="Lead Pharmacy Technician",
++            email="pt@pharmacy.co.uk",
++            staff_role=StaffRole.PHARM_TECH,
++        )
++        mca_user = self.repo.upsert_user(
++            entra_oid="oid-mca-01",
++            slack_user_id="U_MCA_01",
++            full_name="Medicines Counter Assistant",
++            email="mca@pharmacy.co.uk",
++            staff_role=StaffRole.MCA,
++        )
++        mgr_user = self.repo.upsert_user(
++            entra_oid="oid-mgr-01",
++            slack_user_id="U_MGR_01",
++            full_name="Non-Clinical Manager",
++            email="mgr@pharmacy.co.uk",
++            staff_role=StaffRole.MANAGER,
++        )
++        self.assertEqual(pt_user.staff_role, StaffRole.PHARM_TECH)
++        self.assertEqual(mca_user.staff_role, StaffRole.MCA)
++        self.assertEqual(mgr_user.staff_role, StaffRole.MANAGER)
++
++        # Non-qualified Manager cannot complete ANY clinical/pharmacy task
++        for req in (RoleRequirement.PHARM, RoleRequirement.DISPENSER, RoleRequirement.EITHER):
++            self.assertFalse(is_role_authorized(StaffRole.MANAGER, req))
++        self.assertFalse(can_complete_clinical_tasks(StaffRole.MANAGER))
++        self.assertTrue(can_view_audit_and_rota_oversight(StaffRole.MANAGER))
++
++        # PT can complete Dispenser and Either tasks, but not Pharm-only
++        self.assertFalse(is_role_authorized(StaffRole.PHARM_TECH, RoleRequirement.PHARM))
++        self.assertTrue(is_role_authorized(StaffRole.PHARM_TECH, RoleRequirement.DISPENSER))
++        self.assertTrue(is_role_authorized(StaffRole.PHARM_TECH, RoleRequirement.EITHER))
++
++        # MCA can complete Either tasks, but not Dispenser-only or Pharm-only
++        self.assertFalse(is_role_authorized(StaffRole.MCA, RoleRequirement.PHARM))
++        self.assertFalse(is_role_authorized(StaffRole.MCA, RoleRequirement.DISPENSER))
++        self.assertTrue(is_role_authorized(StaffRole.MCA, RoleRequirement.EITHER))
++
++        # Drive Manager, PT, and MCA through repo.complete_task_instance against PostgreSQL
++        instances = self.repo.ensure_instances_for_date(date(2026, 10, 16))
++        either_task = next(i for i in instances if i.assigned_role == RoleRequirement.EITHER and not i.requires_structured_input)
++        disp_task = next(i for i in instances if i.assigned_role == RoleRequirement.DISPENSER)
++        pharm_task = next(i for i in instances if i.assigned_role == RoleRequirement.PHARM)
++
++        # Manager denied on Either task at repository layer
++        mgr_ok, mgr_msg, _ = self.repo.complete_task_instance(
++            instance_id=either_task.instance_id,
++            actor_slack_id=mgr_user.slack_user_id,
++        )
++        self.assertFalse(mgr_ok)
++        self.assertIn("Access Denied", mgr_msg)
++
++        # MCA denied on Dispenser task, allowed on Either task
++        mca_disp_ok, _, _ = self.repo.complete_task_instance(
++            instance_id=disp_task.instance_id,
++            actor_slack_id=mca_user.slack_user_id,
++        )
++        self.assertFalse(mca_disp_ok)
++        mca_either_ok, _, _ = self.repo.complete_task_instance(
++            instance_id=either_task.instance_id,
++            actor_slack_id=mca_user.slack_user_id,
++        )
++        self.assertTrue(mca_either_ok)
++
++        # PT denied on Pharm task, allowed on Dispenser task
++        pt_pharm_ok, _, _ = self.repo.complete_task_instance(
++            instance_id=pharm_task.instance_id,
++            actor_slack_id=pt_user.slack_user_id,
++        )
++        self.assertFalse(pt_pharm_ok)
++        pt_disp_ok, _, _ = self.repo.complete_task_instance(
++            instance_id=disp_task.instance_id,
++            actor_slack_id=pt_user.slack_user_id,
++        )
++        self.assertTrue(pt_disp_ok)
++
++    def test_id012_id028_pii_minimized_in_audit_payload_and_redacted_in_ui(self) -> None:
++        instances = self.repo.ensure_instances_for_date(date(2026, 10, 16))
++        cd_task = next(i for i in instances if i.task_name == "CD Register Reconcile")
++        ok, _, _ = self.repo.complete_task_instance(
++            instance_id=cd_task.instance_id,
++            actor_slack_id=self.pharm.slack_user_id,
++            notes="Verified balance.",
++        )
++        self.assertTrue(ok)
++
++        events = self.repo.get_all_audit_events()
++        completed_ev = next(e for e in events if e["event_type"] == "TASK_COMPLETED")
++        self.assertNotIn("gphc_reg_number", completed_ev["payload"])
++
++        # UI redaction for Manager masks raw actor identifiers
++        redacted_for_mgr = redact_audit_event_for_ui(completed_ev, StaffRole.MANAGER)
++        self.assertTrue(str(redacted_for_mgr["actor_slack_id"]).endswith("***"))
++        self.assertTrue(str(redacted_for_mgr["actor_entra_oid"]).endswith("***"))
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,36 @@
+[
+  {
+    "name": "ruff",
+    "cmd": ["PYTHON", "-m", "ruff", "check", "--select", "E9,F63,F7,F82", "src", "tests"],
+    "read_only": true
+  },
+  {
+    "name": "pytest_suite",
+    "cmd": ["PYTHON", "-m", "pytest", "-q", "tests"],
+    "read_only": true
+  },
+  {
+    "name": "bandit",
+    "cmd": ["PYTHON", "-m", "bandit", "-q", "-r", "src/"],
+    "read_only": true
+  },
+  {
+    "name": "pip_audit",
+    "cmd": ["PYTHON", "-m", "pip_audit", "-r", "requirements.txt", "--no-deps", "--progress-spinner", "off"],
+    "read_only": true
+  },
+  {
+    "name": "secret_scanner_gate",
+    "cmd": [
+      "PYTHON",
+      "-c",
+      "import pathlib, re, sys; pat = re.compile(r'(AKIA[0-9A-Z]{16}|xox[baprs]-[0-9]{10,}|-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----)'); hits = [f'{p}:{m.group(0)}' for p in pathlib.Path('src').rglob('*.py') for m in pat.finditer(p.read_text(encoding='utf-8'))]; print('\\n'.join(hits)); sys.exit(1 if hits else 0)"
+    ],
+    "read_only": true
+  },
+  {
+    "name": "break_glass_staging_mutation_drill",
+    "cmd": ["PYTHON", "-m", "unittest", "tests/test_phase4_backup_and_break_glass.py"],
+    "read_only": false
+  }
+]

@@ -1,0 +1,188 @@
+{
+  "version": "5.0.0",
+  "all_audit_ids": [
+    "ID-001",
+    "ID-002",
+    "ID-003",
+    "ID-004",
+    "ID-005",
+    "ID-006",
+    "ID-007",
+    "ID-008",
+    "ID-009",
+    "ID-010",
+    "ID-011",
+    "ID-012",
+    "ID-013",
+    "ID-014",
+    "ID-016",
+    "ID-017",
+    "ID-018",
+    "ID-019",
+    "ID-020",
+    "ID-021",
+    "ID-022",
+    "ID-023",
+    "ID-024",
+    "ID-025",
+    "ID-028"
+  ],
+  "waived_audit_ids": {},
+  "work_packages": [
+    {
+      "task_id": "WP-1",
+      "title": "Secret Hygiene, .gitignore, Pinned Dependencies & Demo Seed Guard",
+      "audit_ids": ["ID-005", "ID-006", "ID-020", "ID-021"],
+      "critical": true,
+      "allow_waiver": false,
+      "max_changed_lines": 250,
+      "allowed_paths": [
+        ".gitignore",
+        "requirements.txt",
+        "src/config.py",
+        "src/dashboard/app.py",
+        "tests/test_wp1_secrets_and_hygiene.py"
+      ],
+      "forbidden_paths": ["supervisor.py", "verify_audit_log.py", "remediation_plan.json", "gates.json", "db/**"],
+      "required_tests": [
+        "tests/test_wp1_secrets_and_hygiene.py",
+        "tests/test_phase1_schema_and_immutability.py",
+        "tests/test_phase4_backup_and_break_glass.py"
+      ],
+      "acceptance_criteria": [
+        "ID-005: AppConfig.validate_production_secrets() raises RuntimeError when ENV=production and secrets are missing or match known placeholders",
+        "ID-006: .gitignore exists and excludes .env, *.db, s3_vault/, worktrees/, evidence/, and __pycache__/",
+        "ID-020: requirements.txt pins exact == versions for all dependencies",
+        "ID-021: src/dashboard/app.py only seeds demo users when cfg.environment == 'development'"
+      ]
+    },
+    {
+      "task_id": "WP-2",
+      "title": "PostgreSQL-Only Repository, Canonical Hash-Chain Parity, DB-Layer Trigger Enforcement, Optimistic Locking & Single SQL Seed Source",
+      "audit_ids": ["ID-002", "ID-008", "ID-009", "ID-010", "ID-016", "ID-017", "ID-022"],
+      "critical": true,
+      "allow_waiver": false,
+      "max_changed_lines": 1800,
+      "allowed_paths": [
+        ".env.example",
+        "db/01_schema.sql",
+        "src/backup/archive_and_verify.py",
+        "src/backup/service.py",
+        "src/config.py",
+        "src/dashboard/app.py",
+        "src/domain/ledger.py",
+        "src/repository/db_repo.py",
+        "src/slack_bot/service.py",
+        "tests/test_phase1_schema_and_immutability.py",
+        "tests/test_wp2_hash_chain_and_db_integrity.py"
+      ],
+      "forbidden_paths": ["supervisor.py", "verify_audit_log.py", "remediation_plan.json", "gates.json"],
+      "required_tests": [
+        "tests/test_wp2_hash_chain_and_db_integrity.py",
+        "tests/test_phase1_schema_and_immutability.py",
+        "tests/test_phase2_slack_rbac_and_scheduler.py",
+        "tests/test_phase3_entra_and_dashboard_exports.py",
+        "tests/test_phase4_backup_and_break_glass.py",
+        "tests/test_phase5_end_to_end_workflow.py"
+      ],
+      "acceptance_criteria": [
+        "ID-002 & ID-016: Zero sqlite3 imports or usage anywhere in src/ or tests/; all services route exclusively through PostgreSQL (psycopg + DATABASE_URL)",
+        "ID-008: PostgreSQL fn_canonical_jsonb() with COLLATE C and Python canonical_json() serialize JSONB keys and UTC microsecond timestamps identically",
+        "ID-009: complete_task_instance() enforces optimistic locking (WHERE instance_id = %s AND status <> 'Completed') and returns conflict when rowcount == 0",
+        "ID-010: PostgreSQL fn_audit_compute_hash_chain() BEFORE INSERT trigger computes prev_hash and row_hash at the database boundary and rejects forged row_hash or invalid prev_hash",
+        "ID-017: seed_tasks_from_sql_file() executes db/02_seed_tasks.sql directly against PostgreSQL as the single seed source",
+        "ID-022: PostgreSQL fn_audit_compute_hash_chain() uses pg_advisory_xact_lock(20261015, 1) instead of LOCK TABLE IN EXCLUSIVE MODE"
+      ]
+    },
+    {
+      "task_id": "WP-3",
+      "title": "Entra ID Cryptographic OIDC Auth, GPhC Role Policy (MCA/DA/PT/Pharm + Read-Only Manager), PII Minimization & Dashboard Hardening",
+      "audit_ids": ["ID-001", "ID-004", "ID-007", "ID-011", "ID-012", "ID-028"],
+      "critical": true,
+      "allow_waiver": false,
+      "max_changed_lines": 1200,
+      "allowed_paths": [
+        "db/01_schema.sql",
+        "docker-compose.yml",
+        "requirements.txt",
+        "src/dashboard/app.py",
+        "src/dashboard/auth.py",
+        "src/domain/models.py",
+        "src/repository/db_repo.py",
+        "tests/test_wp1_secrets_and_hygiene.py",
+        "tests/test_wp3_entra_auth_and_rbac_hardening.py"
+      ],
+      "forbidden_paths": ["supervisor.py", "verify_audit_log.py", "remediation_plan.json", "gates.json"],
+      "required_tests": [
+        "tests/test_wp3_entra_auth_and_rbac_hardening.py",
+        "tests/test_phase3_entra_and_dashboard_exports.py",
+        "tests/test_phase5_end_to_end_workflow.py"
+      ],
+      "acceptance_criteria": [
+        "ID-001: Dashboard removes staff impersonation selectbox and requires verified Microsoft Entra ID OIDC session or OAuth2 code exchange",
+        "ID-004: EntraIDAuthenticator.verify_id_token() cryptographically verifies RS256 JWT signature against JWKS public keys plus exp, iss, aud, and nonce",
+        "ID-007: docker-compose.yml publishes dashboard port strictly on host loopback 127.0.0.1:8501:8501",
+        "ID-011: StaffRole and PostgreSQL staff_role ENUM support Pharm, PT, Dispenser, MCA, and Manager; Manager has zero clinical task completion authority and read-only oversight",
+        "ID-012 & ID-028: Audit payloads omit gphc_reg_number PII, and dashboard audit tab is restricted to Pharm/Manager with identifier redaction for non-Pharmacists"
+      ]
+    },
+    {
+      "task_id": "WP-4",
+      "title": "Slack Bolt Socket Mode & Signature Verification, APScheduler Tranche Cron, EOD-Scoped Closing Audit & Automatic Missed Transitions",
+      "audit_ids": ["ID-003", "ID-018", "ID-019", "ID-024"],
+      "critical": true,
+      "allow_waiver": false,
+      "max_changed_lines": 800,
+      "allowed_paths": [
+        ".env.example",
+        "db/01_schema.sql",
+        "src/config.py",
+        "src/domain/models.py",
+        "src/repository/db_repo.py",
+        "src/slack_bot/handlers.py",
+        "src/slack_bot/scheduler.py",
+        "src/slack_bot/service.py",
+        "tests/test_wp1_secrets_and_hygiene.py",
+        "tests/test_wp4_slack_scheduler_and_missed_transitions.py"
+      ],
+      "forbidden_paths": ["supervisor.py", "verify_audit_log.py", "remediation_plan.json", "gates.json"],
+      "required_tests": [
+        "tests/test_wp4_slack_scheduler_and_missed_transitions.py",
+        "tests/test_phase2_slack_rbac_and_scheduler.py",
+        "tests/test_phase5_end_to_end_workflow.py"
+      ],
+      "acceptance_criteria": [
+        "ID-003: build_bolt_app() and build_tranche_scheduler() wire Slack Bolt Socket Mode and APScheduler cron triggers for all 4 tranches plus nightly close_expired_periods",
+        "ID-018: CLOSING_AUDIT tranche escalates only End_Of_Day window tasks",
+        "ID-019: mark_overdue_instances_missed() transitions uncompleted past-period tasks to Missed and appends TASK_MISSED audit events",
+        "ID-024: verify_slack_request_signature() enforces HMAC-SHA256 v0 signature and 300s replay window at handler boundary"
+      ]
+    },
+    {
+      "task_id": "WP-5",
+      "title": "Standard AES-256-GCM AEAD Encryption, Hetzner S3 boto3 & Databasus PGRSUS01 Verification, Nightly Cron Schedule, Non-Bypassable Break-Glass Gate & Native pg_dump",
+      "audit_ids": ["ID-003", "ID-013", "ID-014", "ID-023", "ID-025"],
+      "critical": true,
+      "allow_waiver": false,
+      "max_changed_lines": 900,
+      "allowed_paths": [
+        "src/backup/archive_and_verify.py",
+        "src/backup/service.py",
+        "tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py"
+      ],
+      "forbidden_paths": ["supervisor.py", "verify_audit_log.py", "remediation_plan.json", "gates.json"],
+      "required_tests": [
+        "tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py",
+        "tests/test_phase4_backup_and_break_glass.py",
+        "tests/test_phase5_end_to_end_workflow.py"
+      ],
+      "acceptance_criteria": [
+        "ID-013: Replaces custom XOR stream cipher with standard AES-256-GCM AEAD + key versioning and verifies Databasus PGRSUS01 binary envelope",
+        "ID-003: Uploads and downloads encrypted .vault archives and .metadata sidecars via boto3 S3 client against Hetzner Object Storage",
+        "ID-014: Replaces tight restart loop with APScheduler nightly 22:15 schedule, signal-handled daemon loop, and has_backup_verified_for_date() idempotency guard",
+        "ID-023: Enforces mandatory non-bypassable SHA-256 hash-chain verification before and after Break-Glass PostgreSQL restore",
+        "ID-025: Executes PostgreSQL-native pg_dump --format=custom snapshot when pg_dump is available"
+      ]
+    }
+  ]
+}

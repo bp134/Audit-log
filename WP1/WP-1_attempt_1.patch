@@ -1,0 +1,166 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..8eac543
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,17 @@
++# Environment & Secrets (ID-006)
++.env
++.env.*
++!.env.example
++
++# Local Databases & Backup Vaults
++*.db
++*.db-journal
++*.db-wal
++s3_vault/
++
++# Supervisor Worktrees & Runtime Artifacts
++worktrees/
++evidence/
++__pycache__/
++.pytest_cache/
++.venv/
+diff --git a/requirements.txt b/requirements.txt
+index 1cb5efb..3e367aa 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,7 +1,7 @@
+-# Zero-Additional-Cost Open Source Dependencies
+-psycopg[binary]>=3.2.0
+-slack-bolt>=1.21.0
+-APScheduler>=3.10.4
+-streamlit>=1.40.0
+-boto3>=1.35.0
+-msal>=1.31.0
++# Zero-Additional-Cost Open Source Dependencies (ID-020: all 6 dependencies strictly pinned with ==)
++psycopg[binary]==3.3.6
++slack-bolt==1.21.2
++APScheduler==3.10.4
++streamlit==1.61.1
++boto3==1.35.90
++msal==1.39.0
+diff --git a/src/config.py b/src/config.py
+index 9a70868..fe4818e 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -5,9 +5,21 @@ from __future__ import annotations
+ import os
+ from dataclasses import dataclass, field
+ 
++FORBIDDEN_PLACEHOLDERS = frozenset(
++    {
++        "changeme",
++        "xoxb-placeholder",
++        "xapp-placeholder",
++        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
++    }
++)
++
+ 
+ @dataclass(frozen=True)
+ class AppConfig:
++    # Execution environment ("development" vs "production")
++    environment: str = field(default_factory=lambda: os.getenv("ENV", "development").lower())
++
+     # Database (Azure PostgreSQL Flexible Server in production)
+     database_url: str = field(
+         default_factory=lambda: os.getenv(
+@@ -55,3 +67,22 @@ class AppConfig:
+             "BACKUP_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+         )
+     )
++
++    def __post_init__(self) -> None:
++        if self.environment != "development":
++            self.validate_production_secrets()
++
++    def validate_production_secrets(self) -> None:
++        """ID-005: Fail fast if required secrets are missing or use known placeholders."""
++        if not self.database_url or "changeme" in self.database_url:
++            raise RuntimeError("ID-005 Violation: DATABASE_URL is missing or contains default password.")
++        if not self.slack_bot_token or self.slack_bot_token in FORBIDDEN_PLACEHOLDERS:
++            raise RuntimeError("ID-005 Violation: SLACK_BOT_TOKEN is missing or placeholder.")
++        if not self.slack_app_token or self.slack_app_token in FORBIDDEN_PLACEHOLDERS:
++            raise RuntimeError("ID-005 Violation: SLACK_APP_TOKEN is missing or placeholder.")
++        if (
++            not self.backup_encryption_key
++            or self.backup_encryption_key in FORBIDDEN_PLACEHOLDERS
++            or len(self.backup_encryption_key) < 64
++        ):
++            raise RuntimeError("ID-005 Violation: BACKUP_ENCRYPTION_KEY is missing, weak, or default hex.")
+diff --git a/src/dashboard/app.py b/src/dashboard/app.py
+index 00a2443..203d90e 100644
+--- a/src/dashboard/app.py
++++ b/src/dashboard/app.py
+@@ -38,8 +38,8 @@ def render_streamlit_dashboard() -> None:
+     repo = ComplianceRepository(cfg.sqlite_fallback_path)
+     repo.seed_tasks_from_sql_file()
+ 
+-    # Ensure default demo staff profiles exist for immediate interactive preview
+-    if not repo.list_users():
++    # ID-021: Gate demo staff seeding strictly behind ENV=development
++    if cfg.environment == "development" and not repo.list_users():
+         repo.upsert_user(
+             entra_oid="entra-pharm-anjum",
+             slack_user_id="U_PHARM_ANJUM",
+diff --git a/tests/test_wp1_secrets_and_hygiene.py b/tests/test_wp1_secrets_and_hygiene.py
+new file mode 100644
+index 0000000..2883757
+--- /dev/null
++++ b/tests/test_wp1_secrets_and_hygiene.py
+@@ -0,0 +1,54 @@
++"""Deterministic acceptance tests for WP-1 (Audit IDs: ID-005, ID-006, ID-020, ID-021)."""
++
++import ast
++import os
++from pathlib import Path
++import unittest
++from unittest.mock import patch
++
++from src.config import AppConfig
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
++
++class TestWP1SecretsAndHygiene(unittest.TestCase):
++    def test_id005_production_fails_fast_on_default_secrets(self) -> None:
++        with patch.dict(os.environ, {"ENV": "production"}, clear=False):
++            with self.assertRaises(RuntimeError):
++                AppConfig()
++
++    def test_id005_production_succeeds_with_strong_secrets(self) -> None:
++        env = {
++            "ENV": "production",
++            "DATABASE_URL": "postgresql://prod_user:S3cureP@ssw0rd99@db.internal:5432/compliance",
++            "SLACK_BOT_TOKEN": "xoxb-real-token-998877",
++            "SLACK_APP_TOKEN": "xapp-real-token-112233",
++            "BACKUP_ENCRYPTION_KEY": "a" * 64,
++        }
++        with patch.dict(os.environ, env, clear=False):
++            cfg = AppConfig()
++            self.assertEqual(cfg.environment, "production")
++
++    def test_id006_gitignore_blocks_sensitive_paths(self) -> None:
++        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
++        for required_pattern in (".env", "*.db", "s3_vault/", "__pycache__/"):
++            self.assertIn(required_pattern, gitignore)
++
++    def test_id020_requirements_strictly_pinned_all_six_deps(self) -> None:
++        reqs = [
++            line.strip()
++            for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
++            if line.strip() and not line.strip().startswith("#")
++        ]
++        self.assertEqual(len(reqs), 6, f"Expected all 6 dependencies in requirements.txt, got {len(reqs)}: {reqs}")
++        for req in reqs:
++            self.assertIn("==", req, f"Dependency not strictly pinned: {req}")
++
++    def test_id021_demo_staff_seeding_gated_by_development_env(self) -> None:
++        app_source = (REPO_ROOT / "src" / "dashboard" / "app.py").read_text(encoding="utf-8")
++        self.assertIn('cfg.environment == "development"', app_source)
++        ast.parse(app_source)
++
++
++if __name__ == "__main__":
++    unittest.main()

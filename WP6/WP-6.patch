@@ -1,0 +1,569 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..358a8a4
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,69 @@
++name: Pharmacy Compliance CI & Security Gate (ID-027)
++
++on:
++  push:
++    branches: ["main", "release/**"]
++  pull_request:
++    branches: ["main"]
++  workflow_dispatch:
++
++jobs:
++  compliance-verification:
++    runs-on: ubuntu-latest
++
++    services:
++      postgres:
++        image: postgres:18
++        env:
++          POSTGRES_USER: postgres
++          POSTGRES_PASSWORD: postgres
++          POSTGRES_DB: pharmacy_compliance_test
++        ports:
++          - 5432:5432
++        options: >-
++          --health-cmd "pg_isready -U postgres -d pharmacy_compliance_test"
++          --health-interval 5s
++          --health-timeout 5s
++          --health-retries 10
++
++    env:
++      ENV: development
++      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pharmacy_compliance_test
++      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pharmacy_compliance_test
++
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++
++      - name: Set up Python 3.12 and PostgreSQL client tools
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++
++      - name: Install postgresql-client (pg_dump)
++        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
++
++      - name: Install pinned application dependencies and security gates
++        run: |
++          python -m pip install --upgrade pip
++          python -m pip install -r requirements.txt
++          python -m pip install ruff pytest bandit pip-audit
++
++      - name: Gate 1 — Ruff Syntax & Error Check
++        run: python -m ruff check --select E9,F63,F7,F82 src tests
++
++      - name: Gate 2 — Bandit Static Security Analysis (SAST)
++        run: python -m bandit -q -r src/
++
++      - name: Gate 3 — Dependency Vulnerability Audit (pip-audit)
++        run: python -m pip_audit -r requirements.txt --no-deps --progress-spinner off
++
++      - name: Gate 4 — Secret Scanning (Gitleaks)
++        uses: gitleaks/gitleaks-action@v2
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++
++      - name: Gate 5 — Full PostgreSQL 18 Unit, Integration & Break-Glass Suite
++        run: python -B -m pytest -q
+diff --git a/README.md b/README.md
+index fe896e7..ef7d99a 100644
+--- a/README.md
++++ b/README.md
+@@ -4,33 +4,69 @@ A zero-additional-licensing-cost compliance, task scheduling, and immutable audi
+ 
+ ---
+ 
+-## 1. Architecture Overview
++## 1. Architecture Overview (PostgreSQL-Exclusive Runtime)
+ 
+-1. **PostgreSQL Immutable Audit Ledger (`db/01_schema.sql`, `db/02_seed_tasks.sql`):**
+-   - Stores all **33 core pharmacy tasks**:
++1. **PostgreSQL Immutable Audit Ledger (`db/01_schema.sql`, `db/02_seed_tasks.sql`, `src/repository/db_repo.py`):**
++   - Runs **exclusively on PostgreSQL** (`psycopg` + `DATABASE_URL`; zero SQLite dependencies anywhere in the codebase).
++   - Seeds all **33 core pharmacy tasks** from a single canonical SQL source (`db/02_seed_tasks.sql`):
+      - **14 Daily Tasks** split into **Early Morning** (4 tasks), **Anytime** (5 tasks), and **End of Day** (5 tasks).
+      - **10 Weekly Tasks** (completed once on *any* day of the week).
+      - **9 Monthly Tasks** (completed once on *any* day of the month).
+-   - Normalizes role permissions (`Dispenser / Pharm` and `Pharm / Dispenser` $\rightarrow$ `Either`; `Pharm` $\rightarrow$ strictly Pharmacist-only with mandatory GPhC registration number).
+-   - Protects `task_events_audit` with **PostgreSQL database triggers** blocking `UPDATE`, `DELETE`, and `TRUNCATE`, plus a **SHA-256 cryptographic hash chain** (`prev_hash` $\rightarrow$ `row_hash`) across every event.
++   - Enforces **GPhC clinical role permissions** (`Pharm`, `PT`, `Dispenser`, `MCA`, plus read-only `Manager` oversight with zero clinical task completion authority).
++   - Protects `task_events_audit` with **PostgreSQL database triggers** (`fn_audit_compute_hash_chain`, `fn_canonical_jsonb` with `COLLATE "C"`, `pg_advisory_xact_lock`, and `fn_prevent_audit_mutation`) blocking `UPDATE`, `DELETE`, `TRUNCATE`, and forged hashes.
+ 
+-2. **Slack Block Kit & Tranche Scheduler (`src/slack_bot/`):**
+-   - Runs over **Slack Socket Mode** (100% compatible with Slack Free Tier; no public webhook exposure required).
+-   - Posts interactive checklists at **Morning (09:00)**, **Mid-Day (13:00)**, and **End-of-Day (17:30)**.
+-   - Includes a dedicated **Fridge Temperature Modal** (`Min °C`, `Max °C`, `Current °C`) that validates the $2.0^\circ\text{C}\text{–}8.0^\circ\text{C}$ cold-chain range and mandates a corrective action note if an excursion occurs.
+-   - Automatically escalates overdue tasks and blocks unauthorized role clicks in real time.
++2. **Slack Bolt Socket Mode, Request Signature Verification & APScheduler (`src/slack_bot/`):**
++   - Wires `slack_bolt.App` with **HMAC-SHA256 signing-secret verification** (`v0=<hex>` + 300s replay protection) and `SocketModeHandler`.
++   - Uses `APScheduler` (`BackgroundScheduler`) with `Europe/London` timezone-aware `CronTrigger` jobs for **Morning (09:00)**, **Mid-Day (13:00)**, **End-of-Day (17:30)**, **Closing Audit (18:15, scoped strictly to `End_Of_Day` tasks)**, and **Nightly Period-Close `Missed` transitions (00:05)**.
++   - Exposes `/health` and `/ready` HTTP probes on `127.0.0.1:8080` with graceful `SIGTERM`/`SIGINT` shutdown.
+ 
+-3. **Entra ID Governance & Compliance Dashboard (`src/dashboard/`):**
+-   - Validates **Microsoft Entra ID** OIDC tokens (`tid` and `oid` claims) against `users_rbac`.
+-   - Provides a clean, zero-query **Streamlit Web Dashboard** (`src/dashboard/app.py`) with traffic-light KPIs, live checklists, Fridge temperature logs, cryptographic ledger verification, and **One-Click GPhC Inspection CSV / Report Export**.
++3. **Microsoft Entra ID Cryptographic OIDC Auth & Hardened Dashboard (`src/dashboard/`):**
++   - Cryptographically verifies **Microsoft Entra ID** `RS256` JWT signatures against tenant JWKS public keys (`exp`, `iss`, `aud`, `nonce`, `tid`, `oid`) via `PyJWT` and `msal`.
++   - Removes staff profile impersonation pickers, restricts the forensic audit tab to `Pharm`/`Manager` roles with PII minimization and identifier redaction, and binds host port publishing strictly to `127.0.0.1:8501:8501`.
+ 
+-4. **Encrypted Hetzner S3 Archival & "Break-Glass" Restore Verifier (`src/backup/`):**
+-   - Compresses and encrypts nightly database dumps + daily compliance reports client-side (`PBKDF2-HMAC-SHA256` + `HMAC-SHA256` Encrypt-then-MAC authentication tag) before uploading to **Hetzner S3 Object Storage**.
+-   - Immediately executes an automated **"Break-Glass" restore** into an isolated temporary database instance, verifying row counts and the full SHA-256 hash chain to detect silent corruption early.
++4. **AES-256-GCM Encrypted Hetzner S3 Archival, Databasus `PGRSUS01` Verification & Break-Glass Restore (`src/backup/`):**
++   - Compresses and encrypts nightly PostgreSQL snapshots + `pg_dump --format=custom` dumps client-side using standard AEAD **`AES-256-GCM-PBKDF2-SHA256-v2`** with key versioning before uploading `.vault` and `.metadata` sidecars to **Hetzner S3 Object Storage** (`boto3`).
++   - Validates **Databasus `PGRSUS01`** encrypted PostgreSQL backup envelopes (`8B header + 32B salt + 12B IV + AES-GCM payload`).
++   - Enforces **non-bypassable pre-restore and post-restore SHA-256 hash-chain gates** when restoring into an isolated PostgreSQL verification schema, scheduled nightly at `22:15 Europe/London` with an idempotency guard (`has_backup_verified_for_date`).
+ 
+ ---
+ 
+-## 2. Quick Start
++## 2. Implementation & Verification Status Matrix (All 28 Audit Findings)
++
++| Audit ID | Severity | Remediation Summary | Module(s) | Verification Test Suite | Work Package | Status |
++| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
++| **ID-001** | Critical | Removed staff impersonation `st.selectbox`; enforced verified Entra ID OIDC session | `src/dashboard/app.py` | `tests/test_wp3_entra_auth_and_rbac_hardening.py` | WP-3 | **VERIFIED** |
++| **ID-002** | Critical | PostgreSQL-only `ComplianceRepository` via `psycopg` and `DATABASE_URL` | `src/repository/db_repo.py` | `tests/test_wp2_hash_chain_and_db_integrity.py` | WP-2 | **VERIFIED** |
++| **ID-003** | Critical | Wired Slack Bolt Socket Mode, APScheduler cron jobs, and `boto3` Hetzner S3 upload/download | `src/slack_bot/service.py`, `src/backup/archive_and_verify.py` | `tests/test_wp4_slack_scheduler_and_missed_transitions.py`, `tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py` | WP-4 / WP-5 | **VERIFIED** |
++| **ID-004** | High | Cryptographic RS256 JWT validation against Microsoft JWKS (`exp`, `iss`, `aud`, `nonce`) | `src/dashboard/auth.py` | `tests/test_wp3_entra_auth_and_rbac_hardening.py` | WP-3 | **VERIFIED** |
++| **ID-005** | High | Fail-fast startup validation rejecting missing or placeholder secrets in production | `src/config.py` | `tests/test_wp1_secrets_and_hygiene.py` | WP-1 | **VERIFIED** |
++| **ID-006** | High | Added `.gitignore` excluding `.env`, `*.db`, `s3_vault/`, `worktrees/`, `evidence/`, `__pycache__/` | `.gitignore` | `tests/test_wp1_secrets_and_hygiene.py` | WP-1 | **VERIFIED** |
++| **ID-007** | High | Restricted dashboard host port binding to `127.0.0.1:8501:8501` | `docker-compose.yml` | `tests/test_wp3_entra_auth_and_rbac_hardening.py` | WP-3 | **VERIFIED** |
++| **ID-008** | High | Unified canonical JSONB (`fn_canonical_jsonb` with `COLLATE "C"`) and UTC timestamp hashing | `db/01_schema.sql`, `src/domain/ledger.py` | `tests/test_wp2_hash_chain_and_db_integrity.py` | WP-2 | **VERIFIED** |
++| **ID-009** | High | Optimistic locking (`WHERE instance_id = %s AND status <> 'Completed'`) on task completion | `src/repository/db_repo.py` | `tests/test_wp2_hash_chain_and_db_integrity.py` | WP-2 | **VERIFIED** |
++| **ID-010** | High | Database-layer `BEFORE INSERT` hash computation & forged-hash rejection in PostgreSQL | `db/01_schema.sql`, `src/repository/db_repo.py` | `tests/test_wp2_hash_chain_and_db_integrity.py` | WP-2 | **VERIFIED** |
++| **ID-011** | High | GPhC role hierarchy (`Pharm`, `PT`, `Dispenser`, `MCA`) + read-only `Manager` policy | `src/domain/models.py`, `db/01_schema.sql` | `tests/test_wp3_entra_auth_and_rbac_hardening.py` | WP-3 | **VERIFIED** |
++| **ID-012** | High | Removed `gphc_reg_number` PII from raw audit JSON payloads and redacted UI views | `src/repository/db_repo.py`, `src/dashboard/app.py` | `tests/test_wp3_entra_auth_and_rbac_hardening.py` | WP-3 | **VERIFIED** |
++| **ID-013** | Medium | Standard `AES-256-GCM-PBKDF2-SHA256-v2` AEAD encryption + Databasus `PGRSUS01` verifier | `src/backup/archive_and_verify.py` | `tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py` | WP-5 | **VERIFIED** |
++| **ID-014** | Medium | Controlled nightly APScheduler job (`22:15`) + `has_backup_verified_for_date` idempotency guard | `src/backup/service.py` | `tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py` | WP-5 | **VERIFIED** |
++| **ID-015** | Medium | HTTP `/health` & `/ready` probes, `SIGTERM`/`SIGINT` graceful shutdown, and Docker `healthcheck` | `src/slack_bot/service.py`, `src/backup/service.py`, `docker-compose.yml` | `tests/test_wp6_health_cicd_and_docs.py` | WP-6 | **VERIFIED** |
++| **ID-016** | Medium | Retired SQLite (`check_same_thread=False`) completely in favor of PostgreSQL `psycopg` | `src/repository/db_repo.py` | `tests/test_wp2_hash_chain_and_db_integrity.py` | WP-2 | **VERIFIED** |
++| **ID-017** | Medium | Single canonical SQL seed source (`db/02_seed_tasks.sql`) executed at runtime | `src/repository/db_repo.py`, `db/02_seed_tasks.sql` | `tests/test_wp2_hash_chain_and_db_integrity.py` | WP-2 | **VERIFIED** |
++| **ID-018** | Medium | Scoped `CLOSING_AUDIT` escalation strictly to `End_Of_Day` window tasks | `src/slack_bot/scheduler.py` | `tests/test_wp4_slack_scheduler_and_missed_transitions.py` | WP-4 | **VERIFIED** |
++| **ID-019** | Medium | Automatic transition of uncompleted expired-period tasks to `Missed` (`TASK_MISSED`) | `src/repository/db_repo.py`, `src/slack_bot/scheduler.py` | `tests/test_wp4_slack_scheduler_and_missed_transitions.py` | WP-4 | **VERIFIED** |
++| **ID-020** | Medium | Strictly pinned all dependencies with `==` in `requirements.txt` and verified via `pip-audit` | `requirements.txt` | `tests/test_wp1_secrets_and_hygiene.py` | WP-1 | **VERIFIED** |
++| **ID-021** | Medium | Gated demo staff seeding strictly behind `ENV=development` | `src/dashboard/app.py` | `tests/test_wp1_secrets_and_hygiene.py` | WP-1 | **VERIFIED** |
++| **ID-022** | Medium | Replaced `LOCK TABLE IN EXCLUSIVE MODE` with `pg_advisory_xact_lock(20261015, 1)` | `db/01_schema.sql` | `tests/test_wp2_hash_chain_and_db_integrity.py` | WP-2 | **VERIFIED** |
++| **ID-023** | Low | Mandatory non-bypassable pre- and post-restore SHA-256 chain gates in Break-Glass restore | `src/backup/archive_and_verify.py` | `tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py` | WP-5 | **VERIFIED** |
++| **ID-024** | Low | Enforced Slack `v0` HMAC-SHA256 signing-secret and 300s replay verification at boundary | `src/slack_bot/handlers.py`, `src/slack_bot/service.py` | `tests/test_wp4_slack_scheduler_and_missed_transitions.py` | WP-4 | **VERIFIED** |
++| **ID-025** | Low | Wired native PostgreSQL `pg_dump --format=custom` snapshot into encrypted backup flow | `src/backup/archive_and_verify.py`, `src/backup/service.py` | `tests/test_wp5_aes_gcm_s3_and_databasus_break_glass.py` | WP-5 | **VERIFIED** |
++| **ID-026** | Low | Updated `README.md` with accurate architecture and 28-finding verification matrix | `README.md` | `tests/test_wp6_health_cicd_and_docs.py` | WP-6 | **VERIFIED** |
++| **ID-027** | Low | Added GitHub Actions CI/CD workflow running PostgreSQL 18, `pytest`, `ruff`, `bandit`, `pip-audit`, `gitleaks` | `.github/workflows/ci.yml` | `tests/test_wp6_health_cicd_and_docs.py` | WP-6 | **VERIFIED** |
++| **ID-028** | Low | Restricted dashboard audit tab to `Pharm`/`Manager` and redacted sensitive identifiers | `src/dashboard/app.py`, `src/domain/models.py` | `tests/test_wp3_entra_auth_and_rbac_hardening.py` | WP-3 | **VERIFIED** |
++
++---
++
++## 3. Quick Start
+ 
+ ### Apply PostgreSQL Schema & Task Seed (Azure PostgreSQL Flexible Server)
+ ```bash
+@@ -44,12 +80,7 @@ cp .env.example .env
+ docker compose up --build -d
+ ```
+ 
+-### Launch the Compliance Dashboard Locally
+-```bash
+-streamlit run src/dashboard/app.py
+-```
+-
+-### Run the Critic Verification Test Suite (All 5 Phases)
++### Run the PostgreSQL Verification Test Suite
+ ```bash
+-python -m unittest discover -s tests -p "test_*.py" -v
++python -B -m pytest -q
+ ```
+diff --git a/docker-compose.yml b/docker-compose.yml
+index a30b915..0b56880 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -6,8 +6,15 @@ services:
+     build: .
+     container_name: pharmacy_slack_compliance_bot
+     restart: unless-stopped
++    stop_grace_period: 30s
+     env_file: .env
+     command: python -m src.slack_bot.service
++    healthcheck:
++      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=5)"]
++      interval: 30s
++      timeout: 10s
++      retries: 3
++      start_period: 15s
+     volumes:
+       - compliance_data:/app/data
+ 
+@@ -16,10 +23,17 @@ services:
+     build: .
+     container_name: pharmacy_compliance_dashboard
+     restart: unless-stopped
++    stop_grace_period: 30s
+     env_file: .env
+     ports:
+       - "127.0.0.1:8501:8501"
+     command: streamlit run src/dashboard/app.py --server.port=8501 --server.address=0.0.0.0 --server.enableCORS=true --server.enableXsrfProtection=true
++    healthcheck:
++      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5)"]
++      interval: 30s
++      timeout: 10s
++      retries: 3
++      start_period: 20s
+     volumes:
+       - compliance_data:/app/data
+ 
+@@ -28,8 +42,15 @@ services:
+     build: .
+     container_name: pharmacy_backup_verifier
+     restart: unless-stopped
++    stop_grace_period: 30s
+     env_file: .env
+     command: python -m src.backup.service
++    healthcheck:
++      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/ready', timeout=5)"]
++      interval: 30s
++      timeout: 10s
++      retries: 3
++      start_period: 15s
+     volumes:
+       - compliance_data:/app/data
+       - s3_staging_vault:/app/s3_vault
+diff --git a/requirements.txt b/requirements.txt
+index a318c72..e2b12b2 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -7,3 +7,4 @@ boto3==1.35.90
+ msal==1.39.0
+ PyJWT==2.15.1
+ cryptography==50.0.2
++PyYAML==6.0.3
+diff --git a/src/backup/service.py b/src/backup/service.py
+index 34555fe..28f39eb 100644
+--- a/src/backup/service.py
++++ b/src/backup/service.py
+@@ -11,10 +11,10 @@ from __future__ import annotations
+ 
+ from datetime import date, datetime
+ import logging
++import os
+ from pathlib import Path
+-import signal
+ import time
+-from typing import Any, Optional
++from typing import Optional
+ from zoneinfo import ZoneInfo
+ 
+ from apscheduler.schedulers.background import BackgroundScheduler
+@@ -23,6 +23,7 @@ from apscheduler.triggers.cron import CronTrigger
+ from src.backup.archive_and_verify import BreakGlassVerificationReport, HetznerS3BreakGlassManager
+ from src.config import AppConfig
+ from src.repository.db_repo import ComplianceRepository
++from src.slack_bot.service import HealthProbeServer, install_graceful_shutdown_handlers
+ 
+ logger = logging.getLogger("pharmacy_compliance.backup_service")
+ 
+@@ -107,30 +108,26 @@ def build_backup_scheduler(
+ 
+ def main() -> None:
+     """
+-    ID-014: Starts the controlled nightly backup scheduler daemon (`22:15` Europe/London)
+-    and waits for SIGTERM/SIGINT so the Docker container never exits and tight-loops.
++    ID-014 & ID-015: Starts the controlled nightly backup scheduler daemon (`22:15` Europe/London),
++    exposes `/health` and `/ready` probes on port 8081, and handles SIGTERM/SIGINT gracefully.
+     """
+     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+     cfg = AppConfig()
+     run_nightly_backup_and_verify(cfg)
++
++    repo = ComplianceRepository(cfg.database_url)
++    repo.seed_tasks_from_sql_file()
+     scheduler = build_backup_scheduler(cfg)
++    probe_port = int(os.getenv("BACKUP_HEALTH_PORT", "8081"))
++    probe_server = HealthProbeServer(repo, service_name="backup-break-glass-verifier", port=probe_port)
++    probe_server.start()
++    state = install_graceful_shutdown_handlers(repo, scheduler, probe_server)
++
+     scheduler.start()
+     logger.info("Nightly Backup & Break-Glass Scheduler started (22:15 %s).", cfg.timezone)
+ 
+-    stop_requested = False
+-
+-    def _on_signal(_signum: int, _frame: Any) -> None:
+-        nonlocal stop_requested
+-        stop_requested = True
+-
+-    signal.signal(signal.SIGTERM, _on_signal)
+-    signal.signal(signal.SIGINT, _on_signal)
+-
+-    try:
+-        while not stop_requested:
+-            time.sleep(1.0)
+-    finally:
+-        scheduler.shutdown(wait=False)
++    while not state["stopped"]:
++        time.sleep(1.0)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/slack_bot/service.py b/src/slack_bot/service.py
+index 38c349e..aa619db 100644
+--- a/src/slack_bot/service.py
++++ b/src/slack_bot/service.py
+@@ -8,8 +8,14 @@ Production Slack Bolt Socket Mode & APScheduler Service Runner (`src/slack_bot/s
+ from __future__ import annotations
+ 
+ from datetime import date, datetime
++from http.server import BaseHTTPRequestHandler, HTTPServer
++import json
+ import logging
++import os
+ import re
++import signal
++from socketserver import ThreadingMixIn
++import threading
+ from typing import Any
+ from zoneinfo import ZoneInfo
+ 
+@@ -35,6 +41,110 @@ def _current_pharmacy_date(tz_name: str) -> date:
+     return datetime.now(ZoneInfo(tz_name)).date()
+ 
+ 
++def check_database_readiness(repo: ComplianceRepository) -> tuple[bool, str]:
++    """
++    ID-015: Verifies PostgreSQL connectivity and `tasks_master` readiness.
++    """
++    try:
++        if repo.conn.closed:
++            return False, "Database connection is closed."
++        row = repo.conn.execute("SELECT COUNT(*) AS cnt FROM tasks_master").fetchone()
++        cnt = int((row or {"cnt": 0})["cnt"])
++        return True, f"Ready (tasks_master={cnt})"
++    except Exception as exc:
++        return False, f"Database not ready: {exc}"
++
++
++class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
++    daemon_threads = True
++
++
++class HealthProbeServer:
++    """
++    ID-015: Lightweight HTTP `/health` and `/ready` probe server for container orchestration.
++    """
++
++    def __init__(
++        self,
++        repo: ComplianceRepository,
++        *,
++        service_name: str = "slack-compliance-bot",
++        host: str = "127.0.0.1",
++        port: int = 8080,
++    ) -> None:
++        self.repo = repo
++        self.service_name = service_name
++        self.host = host
++        self.port = port
++        parent = self
++
++        class _Handler(BaseHTTPRequestHandler):
++            def do_GET(self) -> None:
++                if self.path == "/health":
++                    body = json.dumps({"status": "alive", "service": parent.service_name}).encode("utf-8")
++                    self.send_response(200)
++                    self.send_header("Content-Type", "application/json")
++                    self.end_headers()
++                    self.wfile.write(body)
++                elif self.path == "/ready":
++                    ready_ok, detail = check_database_readiness(parent.repo)
++                    code = 200 if ready_ok else 503
++                    body = json.dumps(
++                        {
++                            "status": "ready" if ready_ok else "not_ready",
++                            "service": parent.service_name,
++                            "detail": detail,
++                        }
++                    ).encode("utf-8")
++                    self.send_response(code)
++                    self.send_header("Content-Type", "application/json")
++                    self.end_headers()
++                    self.wfile.write(body)
++                else:
++                    self.send_response(404)
++                    self.end_headers()
++
++            def log_message(self, _format: str, *_args: Any) -> None:
++                return
++
++        self._httpd = _ThreadedHTTPServer((self.host, self.port), _Handler)
++        self.actual_port = int(self._httpd.server_address[1])
++        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
++
++    def start(self) -> None:
++        self._thread.start()
++
++    def stop(self) -> None:
++        self._httpd.shutdown()
++        self._httpd.server_close()
++
++
++def install_graceful_shutdown_handlers(
++    repo: ComplianceRepository,
++    scheduler: BackgroundScheduler,
++    probe_server: HealthProbeServer | None = None,
++) -> dict[str, bool]:
++    """
++    ID-015: Installs `SIGTERM` and `SIGINT` handlers that cleanly shut down the APScheduler,
++    stop the health probe server, and close the PostgreSQL connection.
++    """
++    state = {"stopped": False}
++
++    def _handle_signal(_signum: int, _frame: Any) -> None:
++        if state["stopped"]:
++            return
++        state["stopped"] = True
++        if getattr(scheduler, "running", False):
++            scheduler.shutdown(wait=False)
++        if probe_server is not None:
++            probe_server.stop()
++        repo.close()
++
++    signal.signal(signal.SIGTERM, _handle_signal)
++    signal.signal(signal.SIGINT, _handle_signal)
++    return state
++
++
+ def create_slack_runtime(
+     config: AppConfig | None = None,
+ ) -> tuple[ComplianceRepository, SlackComplianceHandler, TrancheSchedulerEngine]:
+@@ -184,10 +294,15 @@ def build_tranche_scheduler(
+ def main() -> None:
+     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+     cfg = AppConfig()
+-    _repo, handler, scheduler_engine = create_slack_runtime(cfg)
++    repo, handler, scheduler_engine = create_slack_runtime(cfg)
+     bolt_app = build_bolt_app(cfg, handler)
+     bg_scheduler = build_tranche_scheduler(cfg, scheduler_engine, bolt_app=bolt_app)
+ 
++    probe_port = int(os.getenv("SLACK_HEALTH_PORT", "8080"))
++    probe_server = HealthProbeServer(repo, service_name="slack-compliance-bot", port=probe_port)
++    probe_server.start()
++    install_graceful_shutdown_handlers(repo, bg_scheduler, probe_server)
++
+     today = _current_pharmacy_date(cfg.timezone)
+     scheduler_engine.run_tranche(TrancheWindow.MORNING, today)
+     bg_scheduler.start()
+diff --git a/tests/test_wp6_health_cicd_and_docs.py b/tests/test_wp6_health_cicd_and_docs.py
+new file mode 100644
+index 0000000..f560a29
+--- /dev/null
++++ b/tests/test_wp6_health_cicd_and_docs.py
+@@ -0,0 +1,104 @@
++"""
++Deterministic PostgreSQL Acceptance Tests for WP-6
++(Audit IDs: ID-015, ID-026, ID-027 — completing all 28 audit findings).
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import signal
++import unittest
++import urllib.error
++import urllib.request
++
++import yaml
++
++from src.config import AppConfig
++from src.repository.db_repo import ComplianceRepository
++from src.slack_bot.scheduler import TrancheSchedulerEngine
++from src.slack_bot.service import (
++    HealthProbeServer,
++    build_tranche_scheduler,
++    check_database_readiness,
++    install_graceful_shutdown_handlers,
++)
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
++
++class TestWP6HealthCicdAndDocs(unittest.TestCase):
++    def setUp(self) -> None:
++        self.repo = ComplianceRepository()
++        self.repo.seed_tasks_from_sql_file()
++
++    def tearDown(self) -> None:
++        self.repo.close()
++
++    def test_id015_health_and_readiness_http_probes_and_graceful_shutdown(self) -> None:
++        ready_ok, detail = check_database_readiness(self.repo)
++        self.assertTrue(ready_ok)
++        self.assertIn("tasks_master=33", detail)
++
++        probe = HealthProbeServer(self.repo, service_name="test-compliance-svc", host="127.0.0.1", port=0)
++        probe.start()
++        try:
++            with urllib.request.urlopen(f"http://127.0.0.1:{probe.actual_port}/health", timeout=5) as resp:
++                self.assertEqual(resp.status, 200)
++                data = json.loads(resp.read().decode("utf-8"))
++                self.assertEqual(data["status"], "alive")
++
++            with urllib.request.urlopen(f"http://127.0.0.1:{probe.actual_port}/ready", timeout=5) as resp:
++                self.assertEqual(resp.status, 200)
++                data = json.loads(resp.read().decode("utf-8"))
++                self.assertEqual(data["status"], "ready")
++        finally:
++            probe.stop()
++
++        # Verify graceful shutdown handler closes DB and stops scheduler, restoring original signal handlers
++        orig_sigterm = signal.getsignal(signal.SIGTERM)
++        orig_sigint = signal.getsignal(signal.SIGINT)
++        try:
++            sched = build_tranche_scheduler(AppConfig(), TrancheSchedulerEngine(self.repo))
++            state = install_graceful_shutdown_handlers(self.repo, sched)
++            self.assertFalse(state["stopped"])
++            handler_fn = signal.getsignal(signal.SIGTERM)
++            self.assertTrue(callable(handler_fn))
++            handler_fn(signal.SIGTERM, None)  # type: ignore[misc]
++            self.assertTrue(state["stopped"])
++            self.assertTrue(self.repo.conn.closed)
++        finally:
++            signal.signal(signal.SIGTERM, orig_sigterm)
++            signal.signal(signal.SIGINT, orig_sigint)
++
++    def test_id015_docker_compose_healthchecks_and_stop_grace_period(self) -> None:
++        compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
++        services = compose["services"]
++        for svc_name in ("slack-compliance-bot", "compliance-dashboard", "backup-break-glass-verifier"):
++            self.assertIn(svc_name, services)
++            self.assertIn("healthcheck", services[svc_name])
++            self.assertEqual(services[svc_name].get("stop_grace_period"), "30s")
++
++    def test_id027_github_actions_ci_workflow_valid_and_complete(self) -> None:
++        ci_path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
++        self.assertTrue(ci_path.exists())
++        ci_doc = yaml.safe_load(ci_path.read_text(encoding="utf-8"))
++        job = ci_doc["jobs"]["compliance-verification"]
++        self.assertEqual(job["services"]["postgres"]["image"], "postgres:18")
++
++        steps_text = json.dumps(job["steps"])
++        for required_gate in ("ruff", "bandit", "pip_audit", "gitleaks", "pytest"):
++            self.assertIn(required_gate, steps_text)
++
++    def test_id026_readme_documents_all_28_audit_ids_and_accurate_architecture(self) -> None:
++        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
++        self.assertIn("AES-256-GCM-PBKDF2-SHA256-v2", readme)
++        self.assertIn("PGRSUS01", readme)
++        self.assertNotIn("Encrypt-then-MAC", readme)
++        for num in range(1, 29):
++            audit_id = f"ID-{num:03d}"
++            self.assertIn(audit_id, readme, f"Missing {audit_id} in README verification matrix")
++
++
++if __name__ == "__main__":
++    unittest.main()

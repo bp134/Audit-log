@@ -1,0 +1,42 @@
+{
+  "packet_id": "WP-3_attempt_1",
+  "task_id": "WP-3",
+  "audit_ids": [
+    "ID-001",
+    "ID-004",
+    "ID-007",
+    "ID-011",
+    "ID-012",
+    "ID-028"
+  ],
+  "attempt": 1,
+  "timestamp_utc": "2026-10-16T17:37:45.595734+00:00",
+  "git_base_ref": "530c312345e8cb1e7c4e53a898d25a52a675928f",
+  "file_hashes_sha256": {
+    "db/01_schema.sql": "1db3936e47897bfea35a2407137f6bfe6d32bb4a09f4ea76b13c38053ebc3f5f",
+    "docker-compose.yml": "e245a9c36b53909160a6563fc2f6810326fb352daaea780e295b64206e7ca873",
+    "requirements.txt": "1cf84e3241851666c022f82fca324b3651a5e270f836f6e68852b47d5a6fbca6",
+    "src/dashboard/app.py": "1a490d69f77fcb7f76b044142cc3b714abedc66850c0c3b24bffa18a0adafb3c",
+    "src/dashboard/auth.py": "fa75fad586d29be3c248297c6de5d46d8ff09f8a8756b211c79d1945f60af6ff",
+    "src/domain/models.py": "6dc1931c0c6cd5d0bc005131e9c16ad7e52d15e6a7d0a9ffddd855e805653a16",
+    "src/repository/db_repo.py": "0a6ff9d21df521eb120c22d9494fbee304f949f5f8cd775dc7f5688fc26c1acc",
+    "tests/test_wp1_secrets_and_hygiene.py": "9985f00524d9a4cbd404132bc81553fe8ab5b08e044b74f626955b57d9eeaaf8",
+    "tests/test_wp3_entra_auth_and_rbac_hardening.py": "ceb218b68322bacb621883a72f934d73cf21f0af9595d9197f945db616a4a93f"
+  },
+  "patch_sha256": "c0fef7cdf2fdef414b7b7e3991cbcbdc06edcfafefca201ae92181f71fafae67",
+  "gate_exit_codes": {
+    "ruff": 0,
+    "pytest_suite": 0,
+    "bandit": 0,
+    "pip_audit": 0,
+    "secret_scanner_gate": 0
+  },
+  "acceptance_exit_codes": {
+    "tests/test_wp3_entra_auth_and_rbac_hardening.py": 0,
+    "tests/test_phase3_entra_and_dashboard_exports.py": 0,
+    "tests/test_phase5_end_to_end_workflow.py": 0
+  },
+  "critic_attestation_valid": true,
+  "critic_advisory_findings": [],
+  "packet_sha256": "c26c03229e1f82b0a1dfca66f6af3982fc9c84ed2b9b8a053f2ed6edab9aef82"
+}

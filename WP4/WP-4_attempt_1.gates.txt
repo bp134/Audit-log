@@ -1,0 +1,114 @@
+{
+  "gates": [
+    {
+      "gate": "ruff",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "ruff",
+        "check",
+        "--select",
+        "E9,F63,F7,F82",
+        "src",
+        "tests"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log\\worktrees\\WP-4\\attempt_1",
+      "timestamp_utc": "2026-10-16T18:07:57.306054+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": "All checks passed!\n",
+      "stderr": ""
+    },
+    {
+      "gate": "pytest_suite",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log\\worktrees\\WP-4\\attempt_1",
+      "timestamp_utc": "2026-10-16T18:08:09.940355+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": ".................................                                        [100%]\n33 passed in 11.31s\n",
+      "stderr": ""
+    },
+    {
+      "gate": "bandit",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "bandit",
+        "-q",
+        "-r",
+        "src/"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log\\worktrees\\WP-4\\attempt_1",
+      "timestamp_utc": "2026-10-16T18:08:10.911093+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "gate": "pip_audit",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-m",
+        "pip_audit",
+        "-r",
+        "requirements.txt",
+        "--no-deps",
+        "--progress-spinner",
+        "off"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log\\worktrees\\WP-4\\attempt_1",
+      "timestamp_utc": "2026-10-16T18:08:46.486876+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "WARNING:pip_audit._cli:--no-deps is supported, but users are encouraged to fully hash their pinned dependencies\nWARNING:pip_audit._cli:Consider using a tool like `pip-compile`: https://pip-tools.readthedocs.io/en/latest/#using-hashes\nNo known vulnerabilities found\n"
+    },
+    {
+      "gate": "secret_scanner_gate",
+      "cmd": [
+        "C:\\Python314\\python.exe",
+        "-c",
+        "import pathlib, re, sys; pat = re.compile(r'(AKIA[0-9A-Z]{16}|xox[baprs]-[0-9]{10,}|-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----)'); hits = [f'{p}:{m.group(0)}' for p in pathlib.Path('src').rglob('*.py') for m in pat.finditer(p.read_text(encoding='utf-8'))]; print('\\n'.join(hits)); sys.exit(1 if hits else 0)"
+      ],
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log\\worktrees\\WP-4\\attempt_1",
+      "timestamp_utc": "2026-10-16T18:08:46.584196+00:00",
+      "read_only": true,
+      "returncode": 0,
+      "stdout": "\n",
+      "stderr": ""
+    }
+  ],
+  "acceptance": [
+    {
+      "test_target": "tests/test_wp4_slack_scheduler_and_missed_transitions.py",
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log\\worktrees\\WP-4\\attempt_1",
+      "timestamp_utc": "2026-10-16T18:08:50.693718+00:00",
+      "returncode": 0,
+      "stdout": "....                                                                     [100%]\n4 passed in 2.39s\n",
+      "stderr": ""
+    },
+    {
+      "test_target": "tests/test_phase2_slack_rbac_and_scheduler.py",
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log\\worktrees\\WP-4\\attempt_1",
+      "timestamp_utc": "2026-10-16T18:08:53.937737+00:00",
+      "returncode": 0,
+      "stdout": "....                                                                     [100%]\n4 passed in 1.58s\n",
+      "stderr": ""
+    },
+    {
+      "test_target": "tests/test_phase5_end_to_end_workflow.py",
+      "cwd": "C:\\Users\\Anjum's\\Documents\\Github-Repo\\Audit-log\\worktrees\\WP-4\\attempt_1",
+      "timestamp_utc": "2026-10-16T18:08:57.175674+00:00",
+      "returncode": 0,
+      "stdout": ".                                                                        [100%]\n1 passed in 1.55s\n",
+      "stderr": ""
+    }
+  ]
+}

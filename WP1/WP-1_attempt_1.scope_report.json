@@ -1,0 +1,15 @@
+{
+  "task_id": "WP-1",
+  "attempt": 1,
+  "passed": true,
+  "total_changed_lines": 120,
+  "max_changed_lines": 250,
+  "touched_files": [
+    ".gitignore",
+    "requirements.txt",
+    "src/config.py",
+    "src/dashboard/app.py",
+    "tests/test_wp1_secrets_and_hygiene.py"
+  ],
+  "violations": []
+}

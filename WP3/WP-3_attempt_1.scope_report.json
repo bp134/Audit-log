@@ -1,0 +1,19 @@
+{
+  "task_id": "WP-3",
+  "attempt": 1,
+  "passed": true,
+  "total_changed_lines": 726,
+  "max_changed_lines": 1200,
+  "touched_files": [
+    "db/01_schema.sql",
+    "docker-compose.yml",
+    "requirements.txt",
+    "src/dashboard/app.py",
+    "src/dashboard/auth.py",
+    "src/domain/models.py",
+    "src/repository/db_repo.py",
+    "tests/test_wp1_secrets_and_hygiene.py",
+    "tests/test_wp3_entra_auth_and_rbac_hardening.py"
+  ],
+  "violations": []
+}

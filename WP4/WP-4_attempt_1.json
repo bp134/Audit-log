@@ -1,0 +1,41 @@
+{
+  "packet_id": "WP-4_attempt_1",
+  "task_id": "WP-4",
+  "audit_ids": [
+    "ID-003",
+    "ID-018",
+    "ID-019",
+    "ID-024"
+  ],
+  "attempt": 1,
+  "timestamp_utc": "2026-10-16T18:08:57.524299+00:00",
+  "git_base_ref": "2313fabcd4cf161743f9cbd877bd9c36b3c06e38",
+  "file_hashes_sha256": {
+    ".env.example": "15b76780ab832ada0e97b84f2b50931e5f88d14f40ca1c7b0ba200ebe0415908",
+    "db/01_schema.sql": "fcab7ce924a700c9b315c6ff98a8f46c4b84ee0c3d74ef8142072cd25b3814a0",
+    "src/config.py": "6a286a9dc6451d49a89e61ce830a039f303e7a851b5689b2b91171f0bfe28073",
+    "src/domain/models.py": "1b6b9e714b32b0d5c899ea468f5a6c1a98a82701075a854976abec3f13860251",
+    "src/repository/db_repo.py": "98c8877912e96d4a2bd7c6353f422f8ca01d427bccb9b068c49595af1b6d8780",
+    "src/slack_bot/handlers.py": "18b3f644835be48acda23534409bc1a656d40cf366726ba57c2f372f970c1e81",
+    "src/slack_bot/scheduler.py": "1ac9924d23ceb65713bb2dad8c325f1d333f88ec1f28c48e6dc0e86695995047",
+    "src/slack_bot/service.py": "72f9cc802ae375a441162c81587daec03e70446c222d3861335fdf166cb19fb2",
+    "tests/test_wp1_secrets_and_hygiene.py": "e74d11336be8343844fd01ccdcfcadf5b462092694150923254d3fc87e3bf96d",
+    "tests/test_wp4_slack_scheduler_and_missed_transitions.py": "6cfca4ba587ad6bffa0371c86a4fd1da2d94c5565f3c0a78a1037193ec042da1"
+  },
+  "patch_sha256": "b6c931b0a312081cd48bc168fda2868e578e414267bc76b6eadb0062f174341c",
+  "gate_exit_codes": {
+    "ruff": 0,
+    "pytest_suite": 0,
+    "bandit": 0,
+    "pip_audit": 0,
+    "secret_scanner_gate": 0
+  },
+  "acceptance_exit_codes": {
+    "tests/test_wp4_slack_scheduler_and_missed_transitions.py": 0,
+    "tests/test_phase2_slack_rbac_and_scheduler.py": 0,
+    "tests/test_phase5_end_to_end_workflow.py": 0
+  },
+  "critic_attestation_valid": true,
+  "critic_advisory_findings": [],
+  "packet_sha256": "f3c237b7e8a2612fd5bd38eef9fbb30541fed66c79955aa4ab13e3bc0c693ead"
+}

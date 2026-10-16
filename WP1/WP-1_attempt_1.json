@@ -1,0 +1,36 @@
+{
+  "packet_id": "WP-1_attempt_1",
+  "task_id": "WP-1",
+  "audit_ids": [
+    "ID-005",
+    "ID-006",
+    "ID-020",
+    "ID-021"
+  ],
+  "attempt": 1,
+  "timestamp_utc": "2026-10-15T12:47:48.675882+00:00",
+  "git_base_ref": "a90838017272745b90317567385c5a65ed089c5f",
+  "file_hashes_sha256": {
+    ".gitignore": "e2b3a8ca9d940f161d081df6b18be11f0c1295603e6f78363044519560609d96",
+    "requirements.txt": "d41e509ec01b9ac65109a1814d655c264e2108f7ebe93f67692e0f68c3bd7431",
+    "src/config.py": "b775b690cf33064f8d448e35516376a7be49acb6e0e0278ee440b751a180fa4b",
+    "src/dashboard/app.py": "b9af6bd302a0ce19f1acc52df318671d1fc1da06ebe4796a81fe16a1add60410",
+    "tests/test_wp1_secrets_and_hygiene.py": "7792135f4be8197d3d50757f834d6eccc69246af1bcd4aa32e8f9d5cfaf121c9"
+  },
+  "patch_sha256": "1d0e2c9f2ffd0e4e4cc68a54b901f0c21d0655aae0c0f3ff8b24f299789ba4d6",
+  "gate_exit_codes": {
+    "ruff": 0,
+    "pytest_suite": 0,
+    "bandit": 0,
+    "pip_audit": 0,
+    "secret_scanner_gate": 0
+  },
+  "acceptance_exit_codes": {
+    "tests/test_wp1_secrets_and_hygiene.py": 0,
+    "tests/test_phase1_schema_and_immutability.py": 0,
+    "tests/test_phase4_backup_and_break_glass.py": 0
+  },
+  "critic_attestation_valid": true,
+  "critic_advisory_findings": [],
+  "packet_sha256": "f23f27c933310d4d8a68db8226b0ad670c5d3763646b6b66fefdd2e00e5e33f9"
+}

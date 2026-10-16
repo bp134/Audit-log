@@ -1,0 +1,764 @@
+diff --git a/.env.example b/.env.example
+index 5ba5c4e..ec32a59 100644
+--- a/.env.example
++++ b/.env.example
+@@ -8,6 +8,7 @@ DATABASE_URL=postgresql://app_compliance_writer:REPLACE_WITH_PASSWORD@your-serve
+ # 2. Slack App (Free Tier - Socket Mode)
+ SLACK_BOT_TOKEN=xoxb-your-bot-token
+ SLACK_APP_TOKEN=xapp-your-socket-mode-token
++SLACK_SIGNING_SECRET=replace-with-slack-signing-secret
+ SLACK_CHANNEL_ID=C0123456789
+ 
+ # 3. Tranche Schedule (Europe/London)
+diff --git a/db/01_schema.sql b/db/01_schema.sql
+index 6cd282e..ad8772a 100644
+--- a/db/01_schema.sql
++++ b/db/01_schema.sql
+@@ -44,6 +44,7 @@ BEGIN
+             'FRIDGE_OUT_OF_RANGE_ALERT',
+             'RBAC_ACCESS_DENIED',
+             'TASK_ESCALATED',
++            'TASK_MISSED',
+             'BREAK_GLASS_VERIFIED'
+         );
+     END IF;
+diff --git a/src/config.py b/src/config.py
+index ac510ad..b80c847 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -10,6 +10,7 @@ FORBIDDEN_PLACEHOLDERS = frozenset(
+         "changeme",
+         "xoxb-placeholder",
+         "xapp-placeholder",
++        "slack-signing-placeholder",
+         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+     }
+ )
+@@ -34,6 +35,9 @@ class AppConfig:
+     # Slack (Socket Mode - Free Tier compatible)
+     slack_bot_token: str = field(default_factory=lambda: os.getenv("SLACK_BOT_TOKEN", "xoxb-placeholder"))
+     slack_app_token: str = field(default_factory=lambda: os.getenv("SLACK_APP_TOKEN", "xapp-placeholder"))
++    slack_signing_secret: str = field(
++        default_factory=lambda: os.getenv("SLACK_SIGNING_SECRET", "slack-signing-placeholder")
++    )
+     slack_channel_id: str = field(default_factory=lambda: os.getenv("SLACK_CHANNEL_ID", "C01PHARMACY"))
+ 
+     # Tranche Times (24h HH:MM format, Europe/London)
+@@ -84,6 +88,8 @@ class AppConfig:
+             raise RuntimeError("ID-005 Violation: SLACK_BOT_TOKEN is missing or placeholder.")
+         if not self.slack_app_token or self.slack_app_token in FORBIDDEN_PLACEHOLDERS:
+             raise RuntimeError("ID-005 Violation: SLACK_APP_TOKEN is missing or placeholder.")
++        if not self.slack_signing_secret or self.slack_signing_secret in FORBIDDEN_PLACEHOLDERS:
++            raise RuntimeError("ID-024 Violation: SLACK_SIGNING_SECRET is missing or placeholder.")
+         if (
+             not self.backup_encryption_key
+             or self.backup_encryption_key in FORBIDDEN_PLACEHOLDERS
+diff --git a/src/domain/models.py b/src/domain/models.py
+index 6343c49..83ebe0b 100644
+--- a/src/domain/models.py
++++ b/src/domain/models.py
+@@ -50,6 +50,7 @@ class AuditEventType(str, Enum):
+     FRIDGE_OUT_OF_RANGE_ALERT = "FRIDGE_OUT_OF_RANGE_ALERT"
+     RBAC_ACCESS_DENIED = "RBAC_ACCESS_DENIED"
+     TASK_ESCALATED = "TASK_ESCALATED"
++    TASK_MISSED = "TASK_MISSED"
+     BREAK_GLASS_VERIFIED = "BREAK_GLASS_VERIFIED"
+ 
+ 
+diff --git a/src/repository/db_repo.py b/src/repository/db_repo.py
+index abd7c46..eb6298b 100644
+--- a/src/repository/db_repo.py
++++ b/src/repository/db_repo.py
+@@ -634,6 +634,64 @@ class ComplianceRepository:
+                 escalated_records.append(updated)
+         return escalated_records
+ 
++    def mark_overdue_instances_missed(
++        self,
++        as_of_date: date,
++        *,
++        recorded_at: Optional[datetime] = None,
++    ) -> list[TaskInstanceRecord]:
++        """
++        ID-019: Marks any uncompleted (`Pending` or `Escalated`) task instances whose
++        `period_end_date < as_of_date` as `Missed` and appends an immutable audit event.
++        """
++        overdue_rows = self.conn.execute(
++            """
++            SELECT instance_id
++            FROM task_instances
++            WHERE period_end_date < %s
++              AND status IN ('Pending', 'Escalated')
++            ORDER BY period_end_date ASC, task_id ASC
++            """,
++            (as_of_date.isoformat(),),
++        ).fetchall()
++
++        missed_records: list[TaskInstanceRecord] = []
++        for row in overdue_rows:
++            iid = str(row["instance_id"])
++            inst = self.get_instance_by_id(iid)
++            if not inst or inst.status in (InstanceStatus.COMPLETED, InstanceStatus.MISSED):
++                continue
++            with self.conn.transaction():
++                cur = self.conn.execute(
++                    """
++                    UPDATE task_instances
++                    SET status = 'Missed'
++                    WHERE instance_id = %s
++                      AND status IN ('Pending', 'Escalated')
++                    """,
++                    (iid,),
++                )
++                if cur.rowcount == 0:
++                    continue
++            self.append_audit_event(
++                event_type=AuditEventType.TASK_MISSED,
++                task_id=inst.task_id,
++                instance_id=inst.instance_id,
++                period_key=inst.period_key,
++                payload={
++                    "task_name": inst.task_name,
++                    "transition": "MISSED",
++                    "previous_status": inst.status.value,
++                    "period_end_date": inst.period_end_date.isoformat(),
++                    "closed_as_of_date": as_of_date.isoformat(),
++                },
++                occurred_at=recorded_at,
++            )
++            updated = self.get_instance_by_id(iid)
++            if updated:
++                missed_records.append(updated)
++        return missed_records
++
+     # -------------------------------------------------------------------------
+     # Audit Verification & Inspection Queries
+     # -------------------------------------------------------------------------
+diff --git a/src/slack_bot/handlers.py b/src/slack_bot/handlers.py
+index 4b511d6..d0cfbc1 100644
+--- a/src/slack_bot/handlers.py
++++ b/src/slack_bot/handlers.py
+@@ -1,12 +1,20 @@
+-"""Slack Socket Mode interaction handlers enforcing RBAC and immutable audit logging."""
++"""
++Slack Socket Mode & Request-Signed Interaction Handlers (`src/slack_bot/handlers.py`).
++- ID-024: Enforces Slack HMAC-SHA256 signing-secret verification (`v0=<hex>`) and 5-minute replay window
++  at the interaction boundary before any handler executes.
++- Enforces GPhC RBAC and immutable PostgreSQL audit logging.
++"""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from datetime import datetime
++import hashlib
++import hmac
++import time
+ from typing import Any, Optional
+ 
+-from src.domain.models import is_role_authorized
++from src.domain.models import AuditEventType, is_role_authorized
+ from src.repository.db_repo import ComplianceRepository
+ from src.slack_bot.blocks import build_fridge_temperature_modal
+ 
+@@ -19,15 +27,88 @@ class SlackInteractionResponse:
+     updated_instance_id: Optional[str] = None
+ 
+ 
++def verify_slack_request_signature(
++    *,
++    signing_secret: str,
++    timestamp: str,
++    body: str,
++    signature: str,
++    max_age_seconds: int = 300,
++    now_epoch: Optional[float] = None,
++) -> bool:
++    """
++    ID-024: Cryptographically verifies a Slack request signature (`X-Slack-Signature` = `v0=<hmac>`)
++    and enforces a 5-minute replay-protection window (`X-Slack-Request-Timestamp`).
++    """
++    if not signing_secret or not timestamp or not signature:
++        return False
++    raw_ts = timestamp.strip()
++    try:
++        ts_int = int(raw_ts)
++    except ValueError:
++        return False
++
++    current_time = now_epoch if now_epoch is not None else time.time()
++    if abs(current_time - ts_int) > max_age_seconds:
++        return False
++
++    basestring = f"v0:{raw_ts}:{body}".encode("utf-8")
++    digest = hmac.new(signing_secret.encode("utf-8"), basestring, hashlib.sha256).hexdigest()
++    expected_sig = f"v0={digest}"
++    return hmac.compare_digest(expected_sig, signature.strip())
++
++
+ class SlackComplianceHandler:
+     """
+     Handles interactive Slack Block Kit button clicks and modal submissions.
+-    Decoupled from network transport so it can be driven by Slack Bolt Socket Mode in production
+-    and directly stress-tested by the Critic suite.
++    When `signing_secret` is configured on the handler (or when `require_signature=True`),
++    validates `X-Slack-Signature` and `X-Slack-Request-Timestamp` before running business logic.
+     """
+ 
+-    def __init__(self, repo: ComplianceRepository) -> None:
++    def __init__(
++        self,
++        repo: ComplianceRepository,
++        *,
++        signing_secret: Optional[str] = None,
++        require_signature: bool = False,
++    ) -> None:
+         self.repo = repo
++        self.signing_secret = signing_secret
++        self.require_signature = require_signature
++
++    def _check_boundary_signature(
++        self,
++        *,
++        signature: Optional[str],
++        timestamp: Optional[str],
++        raw_body: Optional[str],
++    ) -> tuple[bool, Optional[SlackInteractionResponse]]:
++        should_verify = self.require_signature or (
++            self.signing_secret is not None
++            and any(v is not None for v in (signature, timestamp, raw_body))
++        )
++        if not should_verify:
++            return True, None
++
++        valid = verify_slack_request_signature(
++            signing_secret=self.signing_secret or "",
++            timestamp=timestamp or "",
++            body=raw_body or "",
++            signature=signature or "",
++        )
++        if not valid:
++            self.repo.append_audit_event(
++                event_type=AuditEventType.RBAC_ACCESS_DENIED,
++                payload={"surface": "SLACK_BOUNDARY", "reason": "INVALID_SLACK_SIGNATURE"},
++            )
++            return (
++                False,
++                SlackInteractionResponse(
++                    ok=False,
++                    ephemeral_message="Access Denied: Slack request signature verification failed.",
++                ),
++            )
++        return True, None
+ 
+     def handle_button_click(
+         self,
+@@ -35,12 +116,16 @@ class SlackComplianceHandler:
+         action_id: str,
+         actor_slack_id: str,
+         clicked_at: Optional[datetime] = None,
++        signature: Optional[str] = None,
++        timestamp: Optional[str] = None,
++        raw_body: Optional[str] = None,
+     ) -> SlackInteractionResponse:
+-        """
+-        Handles either:
+-        - `complete_task:<instance_id>` -> 1-click completion (after RBAC check)
+-        - `open_fridge_modal:<instance_id>` -> RBAC check, then returns the Fridge Temperature Modal view
+-        """
++        sig_ok, err_resp = self._check_boundary_signature(
++            signature=signature, timestamp=timestamp, raw_body=raw_body
++        )
++        if not sig_ok and err_resp is not None:
++            return err_resp
++
+         if ":" not in action_id:
+             return SlackInteractionResponse(ok=False, ephemeral_message="Malformed Slack action_id.")
+ 
+@@ -53,7 +138,6 @@ class SlackComplianceHandler:
+ 
+             actor = self.repo.get_user_by_slack_id(actor_slack_id)
+             if not actor or not is_role_authorized(actor.staff_role, instance.assigned_role):
+-                # Trigger RBAC denial log via complete_task_instance
+                 ok, msg, _ = self.repo.complete_task_instance(
+                     instance_id=instance_id,
+                     actor_slack_id=actor_slack_id,
+@@ -93,10 +177,16 @@ class SlackComplianceHandler:
+         current_temp_raw: str,
+         action_note: str = "",
+         submitted_at: Optional[datetime] = None,
++        signature: Optional[str] = None,
++        timestamp: Optional[str] = None,
++        raw_body: Optional[str] = None,
+     ) -> SlackInteractionResponse:
+-        """
+-        Validates numeric temperature inputs from the Slack modal and records completion + cold-chain audit events.
+-        """
++        sig_ok, err_resp = self._check_boundary_signature(
++            signature=signature, timestamp=timestamp, raw_body=raw_body
++        )
++        if not sig_ok and err_resp is not None:
++            return err_resp
++
+         try:
+             min_c = float(min_temp_raw.strip())
+             max_c = float(max_temp_raw.strip())
+diff --git a/src/slack_bot/scheduler.py b/src/slack_bot/scheduler.py
+index 371a4f0..f2f005f 100644
+--- a/src/slack_bot/scheduler.py
++++ b/src/slack_bot/scheduler.py
+@@ -61,12 +61,29 @@ class TrancheSchedulerEngine:
+     def __init__(self, repo: ComplianceRepository) -> None:
+         self.repo = repo
+ 
++    def close_expired_periods(
++        self,
++        current_date: date,
++        dispatched_at: Optional[datetime] = None,
++    ) -> list[TaskInstanceRecord]:
++        """
++        ID-019: Marks any uncompleted (`Pending` or `Escalated`) task instances from prior closed
++        periods (`period_end_date < current_date`) as `Missed`.
++        """
++        return self.repo.mark_overdue_instances_missed(
++            as_of_date=current_date,
++            recorded_at=dispatched_at,
++        )
++
+     def run_tranche(
+         self,
+         tranche: TrancheWindow,
+         target_date: date,
+         dispatched_at: Optional[datetime] = None,
+     ) -> TrancheDispatchResult:
++        if tranche == TrancheWindow.MORNING:
++            self.close_expired_periods(target_date, dispatched_at=dispatched_at)
++
+         all_instances = self.repo.ensure_instances_for_date(target_date)
+ 
+         daily_all = [i for i in all_instances if i.frequency == TaskFrequency.DAILY]
+@@ -161,22 +178,29 @@ class TrancheSchedulerEngine:
+             daily_shown = daily_all
+ 
+         elif tranche == TrancheWindow.CLOSING_AUDIT:
++            # ID-018: Scope closing audit escalation strictly to End_Of_Day window tasks
+             overdue_eod_ids = [
+                 i.instance_id
+                 for i in daily_all
+-                if i.status != InstanceStatus.COMPLETED
++                if i.daily_timing_window == DailyWindow.END_OF_DAY
++                and i.status != InstanceStatus.COMPLETED
+             ]
+             if overdue_eod_ids:
+                 escalated_now.extend(
+                     self.repo.escalate_overdue_instances(
+                         overdue_eod_ids,
+-                        reason="Daily task still incomplete at Closing Audit check.",
++                        reason="End-of-Day closing task still incomplete at Closing Audit check.",
+                         escalated_at=dispatched_at,
+                     )
+                 )
+             all_instances = self.repo.get_active_instances_for_date(target_date)
+             daily_all = [i for i in all_instances if i.frequency == TaskFrequency.DAILY]
+-            daily_shown = [i for i in daily_all if i.status != InstanceStatus.COMPLETED]
++            daily_shown = [
++                i
++                for i in daily_all
++                if i.daily_timing_window == DailyWindow.END_OF_DAY
++                and i.status != InstanceStatus.COMPLETED
++            ]
+         else:
+             raise ValueError(f"Unsupported tranche: {tranche}")
+ 
+diff --git a/src/slack_bot/service.py b/src/slack_bot/service.py
+index 150221c..38c349e 100644
+--- a/src/slack_bot/service.py
++++ b/src/slack_bot/service.py
+@@ -1,13 +1,22 @@
+ """
+-Production Slack Socket Mode & APScheduler Service Runner.
+-Connects to Slack Free Tier via Socket Mode (no public inbound webhook URL required)
+-and dispatches Morning, Mid-Day, End-of-Day, and Closing Escalation checklists.
++Production Slack Bolt Socket Mode & APScheduler Service Runner (`src/slack_bot/service.py`).
++- ID-003 & ID-024: Wires `slack_bolt.App` (with signing-secret verification), `SocketModeHandler`,
++  and `APScheduler` (`BackgroundScheduler` with timezone-aware `CronTrigger` jobs for Morning,
++  Mid-Day, End-of-Day, Closing Audit, and Nightly Period-Close `Missed` transitions).
+ """
+ 
+ from __future__ import annotations
+ 
+-from datetime import date, datetime, timezone
++from datetime import date, datetime
+ import logging
++import re
++from typing import Any
++from zoneinfo import ZoneInfo
++
++from apscheduler.schedulers.background import BackgroundScheduler
++from apscheduler.triggers.cron import CronTrigger
++from slack_bolt import App
++from slack_bolt.adapter.socket_mode import SocketModeHandler
+ 
+ from src.config import AppConfig
+ from src.repository.db_repo import ComplianceRepository
+@@ -17,25 +26,175 @@ from src.slack_bot.scheduler import TrancheSchedulerEngine, TrancheWindow
+ logger = logging.getLogger("pharmacy_compliance.slack_service")
+ 
+ 
+-def create_slack_runtime(config: AppConfig | None = None) -> tuple[ComplianceRepository, SlackComplianceHandler, TrancheSchedulerEngine]:
++def _parse_hhmm(time_str: str) -> tuple[int, int]:
++    parts = time_str.strip().split(":")
++    return int(parts[0]), int(parts[1])
++
++
++def _current_pharmacy_date(tz_name: str) -> date:
++    return datetime.now(ZoneInfo(tz_name)).date()
++
++
++def create_slack_runtime(
++    config: AppConfig | None = None,
++) -> tuple[ComplianceRepository, SlackComplianceHandler, TrancheSchedulerEngine]:
+     cfg = config or AppConfig()
+     repo = ComplianceRepository(cfg.database_url)
+     repo.seed_tasks_from_sql_file()
+-    handler = SlackComplianceHandler(repo)
++    handler = SlackComplianceHandler(
++        repo,
++        signing_secret=cfg.slack_signing_secret,
++        require_signature=(cfg.environment == "production"),
++    )
+     scheduler = TrancheSchedulerEngine(repo)
+     return repo, handler, scheduler
+ 
+ 
++def build_bolt_app(cfg: AppConfig, handler: SlackComplianceHandler) -> App:
++    """
++    ID-003 & ID-024: Builds a Slack Bolt `App` with signing-secret middleware and wires
++    interactive Block Kit button clicks and Fridge Temperature modal submissions.
++    """
++    app = App(
++        token=cfg.slack_bot_token,
++        signing_secret=cfg.slack_signing_secret,
++        request_verification_enabled=True,
++        token_verification_enabled=False,
++    )
++
++    @app.action(re.compile(r"^(complete_task|open_fridge_modal):.+"))
++    def _on_task_button_click(ack: Any, body: dict[str, Any], client: Any, context: dict[str, Any]) -> None:
++        ack()
++        actions = body.get("actions") or [{}]
++        action_id = str(actions[0].get("action_id") or "")
++        actor_slack_id = str((body.get("user") or {}).get("id") or "")
++        headers = context.get("headers") or {}
++        resp = handler.handle_button_click(
++            action_id=action_id,
++            actor_slack_id=actor_slack_id,
++            signature=headers.get("X-Slack-Signature") or headers.get("x-slack-signature"),
++            timestamp=headers.get("X-Slack-Request-Timestamp") or headers.get("x-slack-request-timestamp"),
++            raw_body=context.get("raw_body"),
++        )
++        if resp.modal_view and body.get("trigger_id"):
++            client.views_open(trigger_id=body["trigger_id"], view=resp.modal_view)
++        elif body.get("channel", {}).get("id") and actor_slack_id:
++            client.chat_postEphemeral(
++                channel=body["channel"]["id"],
++                user=actor_slack_id,
++                text=resp.ephemeral_message,
++            )
++
++    @app.view(re.compile(r"^submit_fridge_modal:.+"))
++    def _on_fridge_modal_submit(
++        ack: Any, body: dict[str, Any], view: dict[str, Any], client: Any, context: dict[str, Any]
++    ) -> None:
++        ack()
++        callback_id = str(view.get("callback_id") or "")
++        instance_id = str(view.get("private_metadata") or "")
++        if not instance_id and ":" in callback_id:
++            instance_id = callback_id.split(":", 1)[1]
++        actor_slack_id = str((body.get("user") or {}).get("id") or "")
++        values = (view.get("state") or {}).get("values") or {}
++        min_raw = str(((values.get("min_temp_block") or {}).get("min_temp_input") or {}).get("value") or "")
++        max_raw = str(((values.get("max_temp_block") or {}).get("max_temp_input") or {}).get("value") or "")
++        cur_raw = str(((values.get("current_temp_block") or {}).get("current_temp_input") or {}).get("value") or "")
++        note_raw = str(((values.get("action_note_block") or {}).get("action_note_input") or {}).get("value") or "")
++        headers = context.get("headers") or {}
++        resp = handler.handle_fridge_modal_submission(
++            instance_id=instance_id,
++            actor_slack_id=actor_slack_id,
++            min_temp_raw=min_raw,
++            max_temp_raw=max_raw,
++            current_temp_raw=cur_raw,
++            action_note=note_raw,
++            signature=headers.get("X-Slack-Signature") or headers.get("x-slack-signature"),
++            timestamp=headers.get("X-Slack-Request-Timestamp") or headers.get("x-slack-request-timestamp"),
++            raw_body=context.get("raw_body"),
++        )
++        if actor_slack_id:
++            client.chat_postMessage(channel=actor_slack_id, text=resp.ephemeral_message)
++
++    return app
++
++
++def build_tranche_scheduler(
++    cfg: AppConfig,
++    scheduler_engine: TrancheSchedulerEngine,
++    bolt_app: App | None = None,
++) -> BackgroundScheduler:
++    """
++    ID-003 & ID-019: Configures the APScheduler `BackgroundScheduler` with timezone-aware
++    cron triggers for the 4 daily compliance tranches plus the nightly `close_expired_periods` job.
++    """
++    bg_scheduler = BackgroundScheduler(timezone=cfg.timezone)
++
++    def _dispatch_tranche(window: TrancheWindow) -> None:
++        today = _current_pharmacy_date(cfg.timezone)
++        res = scheduler_engine.run_tranche(window, today)
++        if bolt_app is not None and cfg.slack_channel_id and cfg.environment == "production":
++            bolt_app.client.chat_postMessage(
++                channel=cfg.slack_channel_id,
++                text=f"Pharmacy Compliance Checklist ({window.value})",
++                blocks=res.slack_blocks,
++            )
++
++    m_hr, m_min = _parse_hhmm(cfg.tranche_morning_time)
++    md_hr, md_min = _parse_hhmm(cfg.tranche_midday_time)
++    eod_hr, eod_min = _parse_hhmm(cfg.tranche_eod_time)
++    cl_hr, cl_min = _parse_hhmm(cfg.tranche_closing_escalation_time)
++
++    bg_scheduler.add_job(
++        _dispatch_tranche,
++        CronTrigger(hour=m_hr, minute=m_min, timezone=cfg.timezone),
++        args=[TrancheWindow.MORNING],
++        id="tranche_morning",
++        replace_existing=True,
++    )
++    bg_scheduler.add_job(
++        _dispatch_tranche,
++        CronTrigger(hour=md_hr, minute=md_min, timezone=cfg.timezone),
++        args=[TrancheWindow.MID_DAY],
++        id="tranche_midday",
++        replace_existing=True,
++    )
++    bg_scheduler.add_job(
++        _dispatch_tranche,
++        CronTrigger(hour=eod_hr, minute=eod_min, timezone=cfg.timezone),
++        args=[TrancheWindow.END_OF_DAY],
++        id="tranche_eod",
++        replace_existing=True,
++    )
++    bg_scheduler.add_job(
++        _dispatch_tranche,
++        CronTrigger(hour=cl_hr, minute=cl_min, timezone=cfg.timezone),
++        args=[TrancheWindow.CLOSING_AUDIT],
++        id="tranche_closing_audit",
++        replace_existing=True,
++    )
++    bg_scheduler.add_job(
++        lambda: scheduler_engine.close_expired_periods(_current_pharmacy_date(cfg.timezone)),
++        CronTrigger(hour=0, minute=5, timezone=cfg.timezone),
++        id="close_expired_periods",
++        replace_existing=True,
++    )
++    return bg_scheduler
++
++
+ def main() -> None:
+     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+     cfg = AppConfig()
+-    repo, handler, scheduler = create_slack_runtime(cfg)
+-    logger.info("Pharmacy Compliance Slack Service initialized (Timezone=%s).", cfg.timezone)
++    _repo, handler, scheduler_engine = create_slack_runtime(cfg)
++    bolt_app = build_bolt_app(cfg, handler)
++    bg_scheduler = build_tranche_scheduler(cfg, scheduler_engine, bolt_app=bolt_app)
++
++    today = _current_pharmacy_date(cfg.timezone)
++    scheduler_engine.run_tranche(TrancheWindow.MORNING, today)
++    bg_scheduler.start()
++    logger.info("Pharmacy Compliance Slack Bolt + APScheduler started (Timezone=%s).", cfg.timezone)
+ 
+-    # Ensure today's instances are scheduled on startup
+-    today = datetime.now(timezone.utc).date()
+-    scheduler.run_tranche(TrancheWindow.MORNING, today)
+-    logger.info("Initial tranche state verified for %s.", today.isoformat())
++    if cfg.environment == "production":
++        SocketModeHandler(bolt_app, cfg.slack_app_token).start()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_wp1_secrets_and_hygiene.py b/tests/test_wp1_secrets_and_hygiene.py
+index 7ace218..685ed23 100644
+--- a/tests/test_wp1_secrets_and_hygiene.py
++++ b/tests/test_wp1_secrets_and_hygiene.py
+@@ -23,6 +23,7 @@ class TestWP1SecretsAndHygiene(unittest.TestCase):
+             "DATABASE_URL": "postgresql://prod_user:S3cureP@ssw0rd99@db.internal:5432/compliance",
+             "SLACK_BOT_TOKEN": "xoxb-real-token-998877",
+             "SLACK_APP_TOKEN": "xapp-real-token-112233",
++            "SLACK_SIGNING_SECRET": "real-signing-secret-445566",
+             "BACKUP_ENCRYPTION_KEY": "a" * 64,
+         }
+         with patch.dict(os.environ, env, clear=False):
+diff --git a/tests/test_wp4_slack_scheduler_and_missed_transitions.py b/tests/test_wp4_slack_scheduler_and_missed_transitions.py
+new file mode 100644
+index 0000000..d98aa1d
+--- /dev/null
++++ b/tests/test_wp4_slack_scheduler_and_missed_transitions.py
+@@ -0,0 +1,159 @@
++"""
++Deterministic PostgreSQL Acceptance Tests for WP-4
++(Audit IDs: ID-003 [Slack & APScheduler], ID-018, ID-019, ID-024).
++"""
++
++from __future__ import annotations
++
++from datetime import date
++import hashlib
++import hmac
++import time
++import unittest
++
++from src.config import AppConfig
++from src.domain.models import DailyWindow, InstanceStatus, StaffRole
++from src.repository.db_repo import ComplianceRepository
++from src.slack_bot.handlers import SlackComplianceHandler, verify_slack_request_signature
++from src.slack_bot.scheduler import TrancheSchedulerEngine, TrancheWindow
++from src.slack_bot.service import build_bolt_app, build_tranche_scheduler
++
++
++class TestWP4SlackSchedulerAndMissedTransitions(unittest.TestCase):
++    def setUp(self) -> None:
++        self.repo = ComplianceRepository()
++        self.repo.seed_tasks_from_sql_file()
++        self.signing_secret = "slack-test-signing-secret-2026"
++        self.handler = SlackComplianceHandler(
++            self.repo,
++            signing_secret=self.signing_secret,
++        )
++        self.scheduler = TrancheSchedulerEngine(self.repo)
++        self.pharm = self.repo.upsert_user(
++            entra_oid="oid-pharm-wp4",
++            slack_user_id="U_PHARM_WP4",
++            full_name="Anjum Superintendent RP",
++            email="anjum@pharmacy.co.uk",
++            staff_role=StaffRole.PHARM,
++            gphc_reg_number="2054321",
++        )
++
++    def tearDown(self) -> None:
++        self.repo.close()
++
++    def test_id024_slack_hmac_sha256_signature_and_replay_protection(self) -> None:
++        now_ts = str(int(time.time()))
++        raw_body = "payload=%7B%22type%22%3A%22block_actions%22%7D"
++        digest = hmac.new(
++            self.signing_secret.encode("utf-8"),
++            f"v0:{now_ts}:{raw_body}".encode("utf-8"),
++            hashlib.sha256,
++        ).hexdigest()
++        valid_sig = f"v0={digest}"
++
++        self.assertTrue(
++            verify_slack_request_signature(
++                signing_secret=self.signing_secret,
++                timestamp=now_ts,
++                body=raw_body,
++                signature=valid_sig,
++            )
++        )
++
++        # Replay attack (> 300s old) is rejected
++        stale_ts = str(int(time.time()) - 600)
++        stale_digest = hmac.new(
++            self.signing_secret.encode("utf-8"),
++            f"v0:{stale_ts}:{raw_body}".encode("utf-8"),
++            hashlib.sha256,
++        ).hexdigest()
++        self.assertFalse(
++            verify_slack_request_signature(
++                signing_secret=self.signing_secret,
++                timestamp=stale_ts,
++                body=raw_body,
++                signature=f"v0={stale_digest}",
++            )
++        )
++
++        # Forged signature rejected at handler boundary and logged to PostgreSQL audit ledger
++        instances = self.repo.ensure_instances_for_date(date(2026, 10, 16))
++        target = next(i for i in instances if i.task_name == "CD Register Reconcile")
++        bad_resp = self.handler.handle_button_click(
++            action_id=f"complete_task:{target.instance_id}",
++            actor_slack_id=self.pharm.slack_user_id,
++            signature="v0=0000000000000000000000000000000000000000000000000000000000000000",
++            timestamp=now_ts,
++            raw_body=raw_body,
++        )
++        self.assertFalse(bad_resp.ok)
++        self.assertIn("signature verification failed", bad_resp.ephemeral_message)
++
++        ok_resp = self.handler.handle_button_click(
++            action_id=f"complete_task:{target.instance_id}",
++            actor_slack_id=self.pharm.slack_user_id,
++            signature=valid_sig,
++            timestamp=now_ts,
++            raw_body=raw_body,
++        )
++        self.assertTrue(ok_resp.ok)
++
++    def test_id018_closing_audit_escalates_end_of_day_window_tasks_only(self) -> None:
++        op_date = date(2026, 10, 16)
++        self.repo.ensure_instances_for_date(op_date)
++
++        closing_res = self.scheduler.run_tranche(TrancheWindow.CLOSING_AUDIT, op_date)
++        # Only the 5 End_Of_Day tasks should be escalated by CLOSING_AUDIT (not Morning/Anytime)
++        self.assertEqual(len(closing_res.escalated_instances), 5)
++        self.assertTrue(
++            all(i.daily_timing_window == DailyWindow.END_OF_DAY for i in closing_res.escalated_instances)
++        )
++
++    def test_id019_overdue_uncompleted_tasks_automatically_transition_to_missed(self) -> None:
++        day_one = date(2026, 10, 15)
++        day_two = date(2026, 10, 16)
++
++        day_one_instances = self.repo.ensure_instances_for_date(day_one)
++        cd_task = next(i for i in day_one_instances if i.task_name == "CD Register Reconcile")
++        self.repo.complete_task_instance(
++            instance_id=cd_task.instance_id,
++            actor_slack_id=self.pharm.slack_user_id,
++        )
++
++        # Running Day 2 Morning tranche automatically closes expired Day 1 daily instances -> Missed
++        self.scheduler.run_tranche(TrancheWindow.MORNING, day_two)
++
++        refreshed_cd = self.repo.get_instance_by_id(cd_task.instance_id)
++        self.assertIsNotNone(refreshed_cd)
++        self.assertEqual(refreshed_cd.status, InstanceStatus.COMPLETED)  # type: ignore[union-attr]
++
++        uncompleted_day_one = [
++            self.repo.get_instance_by_id(i.instance_id)
++            for i in day_one_instances
++            if i.frequency.value == "Daily" and i.instance_id != cd_task.instance_id
++        ]
++        self.assertEqual(len(uncompleted_day_one), 13)
++        self.assertTrue(all(inst is not None and inst.status == InstanceStatus.MISSED for inst in uncompleted_day_one))
++        self.assertTrue(self.repo.verify_ledger_integrity().is_valid)
++
++    def test_id003_bolt_app_and_apscheduler_cron_jobs_wired(self) -> None:
++        cfg = AppConfig()
++        bolt_app = build_bolt_app(cfg, self.handler)
++        self.assertIsNotNone(bolt_app)
++
++        bg_sched = build_tranche_scheduler(cfg, self.scheduler, bolt_app=bolt_app)
++        job_ids = {job.id for job in bg_sched.get_jobs()}
++        self.assertEqual(
++            job_ids,
++            {
++                "tranche_morning",
++                "tranche_midday",
++                "tranche_eod",
++                "tranche_closing_audit",
++                "close_expired_periods",
++            },
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
