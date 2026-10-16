@@ -1,12 +1,20 @@
-"""Slack Socket Mode interaction handlers enforcing RBAC and immutable audit logging."""
+"""
+Slack Socket Mode & Request-Signed Interaction Handlers (`src/slack_bot/handlers.py`).
+- ID-024: Enforces Slack HMAC-SHA256 signing-secret verification (`v0=<hex>`) and 5-minute replay window
+  at the interaction boundary before any handler executes.
+- Enforces GPhC RBAC and immutable PostgreSQL audit logging.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
+import hmac
+import time
 from typing import Any, Optional
 
-from src.domain.models import is_role_authorized
+from src.domain.models import AuditEventType, is_role_authorized
 from src.repository.db_repo import ComplianceRepository
 from src.slack_bot.blocks import build_fridge_temperature_modal
 
@@ -19,15 +27,88 @@ class SlackInteractionResponse:
     updated_instance_id: Optional[str] = None
 
 
+def verify_slack_request_signature(
+    *,
+    signing_secret: str,
+    timestamp: str,
+    body: str,
+    signature: str,
+    max_age_seconds: int = 300,
+    now_epoch: Optional[float] = None,
+) -> bool:
+    """
+    ID-024: Cryptographically verifies a Slack request signature (`X-Slack-Signature` = `v0=<hmac>`)
+    and enforces a 5-minute replay-protection window (`X-Slack-Request-Timestamp`).
+    """
+    if not signing_secret or not timestamp or not signature:
+        return False
+    raw_ts = timestamp.strip()
+    try:
+        ts_int = int(raw_ts)
+    except ValueError:
+        return False
+
+    current_time = now_epoch if now_epoch is not None else time.time()
+    if abs(current_time - ts_int) > max_age_seconds:
+        return False
+
+    basestring = f"v0:{raw_ts}:{body}".encode("utf-8")
+    digest = hmac.new(signing_secret.encode("utf-8"), basestring, hashlib.sha256).hexdigest()
+    expected_sig = f"v0={digest}"
+    return hmac.compare_digest(expected_sig, signature.strip())
+
+
 class SlackComplianceHandler:
     """
     Handles interactive Slack Block Kit button clicks and modal submissions.
-    Decoupled from network transport so it can be driven by Slack Bolt Socket Mode in production
-    and directly stress-tested by the Critic suite.
+    When `signing_secret` is configured on the handler (or when `require_signature=True`),
+    validates `X-Slack-Signature` and `X-Slack-Request-Timestamp` before running business logic.
     """
 
-    def __init__(self, repo: ComplianceRepository) -> None:
+    def __init__(
+        self,
+        repo: ComplianceRepository,
+        *,
+        signing_secret: Optional[str] = None,
+        require_signature: bool = False,
+    ) -> None:
         self.repo = repo
+        self.signing_secret = signing_secret
+        self.require_signature = require_signature
+
+    def _check_boundary_signature(
+        self,
+        *,
+        signature: Optional[str],
+        timestamp: Optional[str],
+        raw_body: Optional[str],
+    ) -> tuple[bool, Optional[SlackInteractionResponse]]:
+        should_verify = self.require_signature or (
+            self.signing_secret is not None
+            and any(v is not None for v in (signature, timestamp, raw_body))
+        )
+        if not should_verify:
+            return True, None
+
+        valid = verify_slack_request_signature(
+            signing_secret=self.signing_secret or "",
+            timestamp=timestamp or "",
+            body=raw_body or "",
+            signature=signature or "",
+        )
+        if not valid:
+            self.repo.append_audit_event(
+                event_type=AuditEventType.RBAC_ACCESS_DENIED,
+                payload={"surface": "SLACK_BOUNDARY", "reason": "INVALID_SLACK_SIGNATURE"},
+            )
+            return (
+                False,
+                SlackInteractionResponse(
+                    ok=False,
+                    ephemeral_message="Access Denied: Slack request signature verification failed.",
+                ),
+            )
+        return True, None
 
     def handle_button_click(
         self,
@@ -35,12 +116,16 @@ class SlackComplianceHandler:
         action_id: str,
         actor_slack_id: str,
         clicked_at: Optional[datetime] = None,
+        signature: Optional[str] = None,
+        timestamp: Optional[str] = None,
+        raw_body: Optional[str] = None,
     ) -> SlackInteractionResponse:
-        """
-        Handles either:
-        - `complete_task:<instance_id>` -> 1-click completion (after RBAC check)
-        - `open_fridge_modal:<instance_id>` -> RBAC check, then returns the Fridge Temperature Modal view
-        """
+        sig_ok, err_resp = self._check_boundary_signature(
+            signature=signature, timestamp=timestamp, raw_body=raw_body
+        )
+        if not sig_ok and err_resp is not None:
+            return err_resp
+
         if ":" not in action_id:
             return SlackInteractionResponse(ok=False, ephemeral_message="Malformed Slack action_id.")
 
@@ -53,7 +138,6 @@ class SlackComplianceHandler:
 
             actor = self.repo.get_user_by_slack_id(actor_slack_id)
             if not actor or not is_role_authorized(actor.staff_role, instance.assigned_role):
-                # Trigger RBAC denial log via complete_task_instance
                 ok, msg, _ = self.repo.complete_task_instance(
                     instance_id=instance_id,
                     actor_slack_id=actor_slack_id,
@@ -93,10 +177,16 @@ class SlackComplianceHandler:
         current_temp_raw: str,
         action_note: str = "",
         submitted_at: Optional[datetime] = None,
+        signature: Optional[str] = None,
+        timestamp: Optional[str] = None,
+        raw_body: Optional[str] = None,
     ) -> SlackInteractionResponse:
-        """
-        Validates numeric temperature inputs from the Slack modal and records completion + cold-chain audit events.
-        """
+        sig_ok, err_resp = self._check_boundary_signature(
+            signature=signature, timestamp=timestamp, raw_body=raw_body
+        )
+        if not sig_ok and err_resp is not None:
+            return err_resp
+
         try:
             min_c = float(min_temp_raw.strip())
             max_c = float(max_temp_raw.strip())

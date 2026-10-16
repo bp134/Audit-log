@@ -10,6 +10,7 @@ FORBIDDEN_PLACEHOLDERS = frozenset(
         "changeme",
         "xoxb-placeholder",
         "xapp-placeholder",
+        "slack-signing-placeholder",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     }
 )
@@ -34,6 +35,9 @@ class AppConfig:
     # Slack (Socket Mode - Free Tier compatible)
     slack_bot_token: str = field(default_factory=lambda: os.getenv("SLACK_BOT_TOKEN", "xoxb-placeholder"))
     slack_app_token: str = field(default_factory=lambda: os.getenv("SLACK_APP_TOKEN", "xapp-placeholder"))
+    slack_signing_secret: str = field(
+        default_factory=lambda: os.getenv("SLACK_SIGNING_SECRET", "slack-signing-placeholder")
+    )
     slack_channel_id: str = field(default_factory=lambda: os.getenv("SLACK_CHANNEL_ID", "C01PHARMACY"))
 
     # Tranche Times (24h HH:MM format, Europe/London)
@@ -84,6 +88,8 @@ class AppConfig:
             raise RuntimeError("ID-005 Violation: SLACK_BOT_TOKEN is missing or placeholder.")
         if not self.slack_app_token or self.slack_app_token in FORBIDDEN_PLACEHOLDERS:
             raise RuntimeError("ID-005 Violation: SLACK_APP_TOKEN is missing or placeholder.")
+        if not self.slack_signing_secret or self.slack_signing_secret in FORBIDDEN_PLACEHOLDERS:
+            raise RuntimeError("ID-024 Violation: SLACK_SIGNING_SECRET is missing or placeholder.")
         if (
             not self.backup_encryption_key
             or self.backup_encryption_key in FORBIDDEN_PLACEHOLDERS

@@ -44,6 +44,7 @@ BEGIN
             'FRIDGE_OUT_OF_RANGE_ALERT',
             'RBAC_ACCESS_DENIED',
             'TASK_ESCALATED',
+            'TASK_MISSED',
             'BREAK_GLASS_VERIFIED'
         );
     END IF;

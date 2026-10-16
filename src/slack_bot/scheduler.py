@@ -61,12 +61,29 @@ class TrancheSchedulerEngine:
     def __init__(self, repo: ComplianceRepository) -> None:
         self.repo = repo
 
+    def close_expired_periods(
+        self,
+        current_date: date,
+        dispatched_at: Optional[datetime] = None,
+    ) -> list[TaskInstanceRecord]:
+        """
+        ID-019: Marks any uncompleted (`Pending` or `Escalated`) task instances from prior closed
+        periods (`period_end_date < current_date`) as `Missed`.
+        """
+        return self.repo.mark_overdue_instances_missed(
+            as_of_date=current_date,
+            recorded_at=dispatched_at,
+        )
+
     def run_tranche(
         self,
         tranche: TrancheWindow,
         target_date: date,
         dispatched_at: Optional[datetime] = None,
     ) -> TrancheDispatchResult:
+        if tranche == TrancheWindow.MORNING:
+            self.close_expired_periods(target_date, dispatched_at=dispatched_at)
+
         all_instances = self.repo.ensure_instances_for_date(target_date)
 
         daily_all = [i for i in all_instances if i.frequency == TaskFrequency.DAILY]
@@ -161,22 +178,29 @@ class TrancheSchedulerEngine:
             daily_shown = daily_all
 
         elif tranche == TrancheWindow.CLOSING_AUDIT:
+            # ID-018: Scope closing audit escalation strictly to End_Of_Day window tasks
             overdue_eod_ids = [
                 i.instance_id
                 for i in daily_all
-                if i.status != InstanceStatus.COMPLETED
+                if i.daily_timing_window == DailyWindow.END_OF_DAY
+                and i.status != InstanceStatus.COMPLETED
             ]
             if overdue_eod_ids:
                 escalated_now.extend(
                     self.repo.escalate_overdue_instances(
                         overdue_eod_ids,
-                        reason="Daily task still incomplete at Closing Audit check.",
+                        reason="End-of-Day closing task still incomplete at Closing Audit check.",
                         escalated_at=dispatched_at,
                     )
                 )
             all_instances = self.repo.get_active_instances_for_date(target_date)
             daily_all = [i for i in all_instances if i.frequency == TaskFrequency.DAILY]
-            daily_shown = [i for i in daily_all if i.status != InstanceStatus.COMPLETED]
+            daily_shown = [
+                i
+                for i in daily_all
+                if i.daily_timing_window == DailyWindow.END_OF_DAY
+                and i.status != InstanceStatus.COMPLETED
+            ]
         else:
             raise ValueError(f"Unsupported tranche: {tranche}")
 

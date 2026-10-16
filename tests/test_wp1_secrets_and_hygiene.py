@@ -23,6 +23,7 @@ class TestWP1SecretsAndHygiene(unittest.TestCase):
             "DATABASE_URL": "postgresql://prod_user:S3cureP@ssw0rd99@db.internal:5432/compliance",
             "SLACK_BOT_TOKEN": "xoxb-real-token-998877",
             "SLACK_APP_TOKEN": "xapp-real-token-112233",
+            "SLACK_SIGNING_SECRET": "real-signing-secret-445566",
             "BACKUP_ENCRYPTION_KEY": "a" * 64,
         }
         with patch.dict(os.environ, env, clear=False):

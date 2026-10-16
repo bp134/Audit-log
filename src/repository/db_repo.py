@@ -634,6 +634,64 @@ class ComplianceRepository:
                 escalated_records.append(updated)
         return escalated_records
 
+    def mark_overdue_instances_missed(
+        self,
+        as_of_date: date,
+        *,
+        recorded_at: Optional[datetime] = None,
+    ) -> list[TaskInstanceRecord]:
+        """
+        ID-019: Marks any uncompleted (`Pending` or `Escalated`) task instances whose
+        `period_end_date < as_of_date` as `Missed` and appends an immutable audit event.
+        """
+        overdue_rows = self.conn.execute(
+            """
+            SELECT instance_id
+            FROM task_instances
+            WHERE period_end_date < %s
+              AND status IN ('Pending', 'Escalated')
+            ORDER BY period_end_date ASC, task_id ASC
+            """,
+            (as_of_date.isoformat(),),
+        ).fetchall()
+
+        missed_records: list[TaskInstanceRecord] = []
+        for row in overdue_rows:
+            iid = str(row["instance_id"])
+            inst = self.get_instance_by_id(iid)
+            if not inst or inst.status in (InstanceStatus.COMPLETED, InstanceStatus.MISSED):
+                continue
+            with self.conn.transaction():
+                cur = self.conn.execute(
+                    """
+                    UPDATE task_instances
+                    SET status = 'Missed'
+                    WHERE instance_id = %s
+                      AND status IN ('Pending', 'Escalated')
+                    """,
+                    (iid,),
+                )
+                if cur.rowcount == 0:
+                    continue
+            self.append_audit_event(
+                event_type=AuditEventType.TASK_MISSED,
+                task_id=inst.task_id,
+                instance_id=inst.instance_id,
+                period_key=inst.period_key,
+                payload={
+                    "task_name": inst.task_name,
+                    "transition": "MISSED",
+                    "previous_status": inst.status.value,
+                    "period_end_date": inst.period_end_date.isoformat(),
+                    "closed_as_of_date": as_of_date.isoformat(),
+                },
+                occurred_at=recorded_at,
+            )
+            updated = self.get_instance_by_id(iid)
+            if updated:
+                missed_records.append(updated)
+        return missed_records
+
     # -------------------------------------------------------------------------
     # Audit Verification & Inspection Queries
     # -------------------------------------------------------------------------
