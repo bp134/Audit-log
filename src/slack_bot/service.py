@@ -8,8 +8,14 @@ Production Slack Bolt Socket Mode & APScheduler Service Runner (`src/slack_bot/s
 from __future__ import annotations
 
 from datetime import date, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
 import logging
+import os
 import re
+import signal
+from socketserver import ThreadingMixIn
+import threading
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -33,6 +39,110 @@ def _parse_hhmm(time_str: str) -> tuple[int, int]:
 
 def _current_pharmacy_date(tz_name: str) -> date:
     return datetime.now(ZoneInfo(tz_name)).date()
+
+
+def check_database_readiness(repo: ComplianceRepository) -> tuple[bool, str]:
+    """
+    ID-015: Verifies PostgreSQL connectivity and `tasks_master` readiness.
+    """
+    try:
+        if repo.conn.closed:
+            return False, "Database connection is closed."
+        row = repo.conn.execute("SELECT COUNT(*) AS cnt FROM tasks_master").fetchone()
+        cnt = int((row or {"cnt": 0})["cnt"])
+        return True, f"Ready (tasks_master={cnt})"
+    except Exception as exc:
+        return False, f"Database not ready: {exc}"
+
+
+class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+class HealthProbeServer:
+    """
+    ID-015: Lightweight HTTP `/health` and `/ready` probe server for container orchestration.
+    """
+
+    def __init__(
+        self,
+        repo: ComplianceRepository,
+        *,
+        service_name: str = "slack-compliance-bot",
+        host: str = "127.0.0.1",
+        port: int = 8080,
+    ) -> None:
+        self.repo = repo
+        self.service_name = service_name
+        self.host = host
+        self.port = port
+        parent = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/health":
+                    body = json.dumps({"status": "alive", "service": parent.service_name}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/ready":
+                    ready_ok, detail = check_database_readiness(parent.repo)
+                    code = 200 if ready_ok else 503
+                    body = json.dumps(
+                        {
+                            "status": "ready" if ready_ok else "not_ready",
+                            "service": parent.service_name,
+                            "detail": detail,
+                        }
+                    ).encode("utf-8")
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+        self._httpd = _ThreadedHTTPServer((self.host, self.port), _Handler)
+        self.actual_port = int(self._httpd.server_address[1])
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+def install_graceful_shutdown_handlers(
+    repo: ComplianceRepository,
+    scheduler: BackgroundScheduler,
+    probe_server: HealthProbeServer | None = None,
+) -> dict[str, bool]:
+    """
+    ID-015: Installs `SIGTERM` and `SIGINT` handlers that cleanly shut down the APScheduler,
+    stop the health probe server, and close the PostgreSQL connection.
+    """
+    state = {"stopped": False}
+
+    def _handle_signal(_signum: int, _frame: Any) -> None:
+        if state["stopped"]:
+            return
+        state["stopped"] = True
+        if getattr(scheduler, "running", False):
+            scheduler.shutdown(wait=False)
+        if probe_server is not None:
+            probe_server.stop()
+        repo.close()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    return state
 
 
 def create_slack_runtime(
@@ -184,9 +294,14 @@ def build_tranche_scheduler(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     cfg = AppConfig()
-    _repo, handler, scheduler_engine = create_slack_runtime(cfg)
+    repo, handler, scheduler_engine = create_slack_runtime(cfg)
     bolt_app = build_bolt_app(cfg, handler)
     bg_scheduler = build_tranche_scheduler(cfg, scheduler_engine, bolt_app=bolt_app)
+
+    probe_port = int(os.getenv("SLACK_HEALTH_PORT", "8080"))
+    probe_server = HealthProbeServer(repo, service_name="slack-compliance-bot", port=probe_port)
+    probe_server.start()
+    install_graceful_shutdown_handlers(repo, bg_scheduler, probe_server)
 
     today = _current_pharmacy_date(cfg.timezone)
     scheduler_engine.run_tranche(TrancheWindow.MORNING, today)

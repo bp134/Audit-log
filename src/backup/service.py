@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import logging
+import os
 from pathlib import Path
-import signal
 import time
-from typing import Any, Optional
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -23,6 +23,7 @@ from apscheduler.triggers.cron import CronTrigger
 from src.backup.archive_and_verify import BreakGlassVerificationReport, HetznerS3BreakGlassManager
 from src.config import AppConfig
 from src.repository.db_repo import ComplianceRepository
+from src.slack_bot.service import HealthProbeServer, install_graceful_shutdown_handlers
 
 logger = logging.getLogger("pharmacy_compliance.backup_service")
 
@@ -107,30 +108,26 @@ def build_backup_scheduler(
 
 def main() -> None:
     """
-    ID-014: Starts the controlled nightly backup scheduler daemon (`22:15` Europe/London)
-    and waits for SIGTERM/SIGINT so the Docker container never exits and tight-loops.
+    ID-014 & ID-015: Starts the controlled nightly backup scheduler daemon (`22:15` Europe/London),
+    exposes `/health` and `/ready` probes on port 8081, and handles SIGTERM/SIGINT gracefully.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     cfg = AppConfig()
     run_nightly_backup_and_verify(cfg)
+
+    repo = ComplianceRepository(cfg.database_url)
+    repo.seed_tasks_from_sql_file()
     scheduler = build_backup_scheduler(cfg)
+    probe_port = int(os.getenv("BACKUP_HEALTH_PORT", "8081"))
+    probe_server = HealthProbeServer(repo, service_name="backup-break-glass-verifier", port=probe_port)
+    probe_server.start()
+    state = install_graceful_shutdown_handlers(repo, scheduler, probe_server)
+
     scheduler.start()
     logger.info("Nightly Backup & Break-Glass Scheduler started (22:15 %s).", cfg.timezone)
 
-    stop_requested = False
-
-    def _on_signal(_signum: int, _frame: Any) -> None:
-        nonlocal stop_requested
-        stop_requested = True
-
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
-
-    try:
-        while not stop_requested:
-            time.sleep(1.0)
-    finally:
-        scheduler.shutdown(wait=False)
+    while not state["stopped"]:
+        time.sleep(1.0)
 
 
 if __name__ == "__main__":

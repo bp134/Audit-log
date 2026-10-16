@@ -6,8 +6,15 @@ services:
     build: .
     container_name: pharmacy_slack_compliance_bot
     restart: unless-stopped
+    stop_grace_period: 30s
     env_file: .env
     command: python -m src.slack_bot.service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     volumes:
       - compliance_data:/app/data
 
@@ -16,10 +23,17 @@ services:
     build: .
     container_name: pharmacy_compliance_dashboard
     restart: unless-stopped
+    stop_grace_period: 30s
     env_file: .env
     ports:
       - "127.0.0.1:8501:8501"
     command: streamlit run src/dashboard/app.py --server.port=8501 --server.address=0.0.0.0 --server.enableCORS=true --server.enableXsrfProtection=true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     volumes:
       - compliance_data:/app/data
 
@@ -28,8 +42,15 @@ services:
     build: .
     container_name: pharmacy_backup_verifier
     restart: unless-stopped
+    stop_grace_period: 30s
     env_file: .env
     command: python -m src.backup.service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/ready', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     volumes:
       - compliance_data:/app/data
       - s3_staging_vault:/app/s3_vault
