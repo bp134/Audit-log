@@ -15,6 +15,20 @@ def canonical_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
 
 
+def format_canonical_utc_timestamp(ts: Any) -> str:
+    """
+    ID-008: Canonical UTC timestamp formatter (`YYYY-MM-DDTHH:MM:SS.ffffffZ`)
+    identical to PostgreSQL `to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`.
+    """
+    from datetime import datetime, timezone
+
+    if isinstance(ts, str):
+        return ts
+    if isinstance(ts, datetime):
+        return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    raise TypeError(f"Unsupported timestamp type for canonical ledger hash: {type(ts)}")
+
+
 def compute_audit_row_hash(
     *,
     event_id: str,

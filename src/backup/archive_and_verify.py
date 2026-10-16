@@ -21,6 +21,7 @@ from typing import Any, Optional
 import uuid
 
 from src.dashboard.reporting import generate_daily_compliance_report_markdown
+from src.domain.ledger import canonical_json, format_canonical_utc_timestamp
 from src.domain.models import AuditEventType
 from src.repository.db_repo import ComplianceRepository
 
@@ -140,9 +141,31 @@ class HetznerS3BreakGlassManager:
         Exports all tables + the daily signed compliance report, encrypts client-side,
         and writes to the S3 object key `backups/YYYY/MM/pharmacy_backup_YYYY-MM-DD.vault`.
         """
-        users = [dict(r) for r in self.repo.conn.execute("SELECT * FROM users_rbac").fetchall()]
-        tasks = [dict(r) for r in self.repo.conn.execute("SELECT * FROM tasks_master").fetchall()]
-        instances = [dict(r) for r in self.repo.conn.execute("SELECT * FROM task_instances").fetchall()]
+        users = []
+        for r in self.repo.conn.execute("SELECT * FROM users_rbac").fetchall():
+            u = dict(r)
+            u["user_id"] = str(u["user_id"])
+            u["created_at"] = format_canonical_utc_timestamp(u["created_at"])
+            u["updated_at"] = format_canonical_utc_timestamp(u["updated_at"])
+            users.append(u)
+        tasks = []
+        for r in self.repo.conn.execute("SELECT * FROM tasks_master").fetchall():
+            t = dict(r)
+            t["created_at"] = format_canonical_utc_timestamp(t["created_at"])
+            t["input_schema"] = canonical_json(t["input_schema"]) if isinstance(t["input_schema"], dict) else t["input_schema"]
+            tasks.append(t)
+        instances = []
+        for r in self.repo.conn.execute("SELECT * FROM task_instances").fetchall():
+            inst = dict(r)
+            inst["instance_id"] = str(inst["instance_id"])
+            inst["period_start_date"] = inst["period_start_date"].isoformat() if isinstance(inst["period_start_date"], date) else str(inst["period_start_date"])
+            inst["period_end_date"] = inst["period_end_date"].isoformat() if isinstance(inst["period_end_date"], date) else str(inst["period_end_date"])
+            inst["completed_by_user_id"] = str(inst["completed_by_user_id"]) if inst["completed_by_user_id"] else None
+            inst["completed_at"] = format_canonical_utc_timestamp(inst["completed_at"]) if inst["completed_at"] else None
+            inst["last_reminded_at"] = format_canonical_utc_timestamp(inst["last_reminded_at"]) if inst["last_reminded_at"] else None
+            inst["created_at"] = format_canonical_utc_timestamp(inst["created_at"])
+            inst["structured_data"] = canonical_json(inst["structured_data"]) if isinstance(inst["structured_data"], dict) else inst["structured_data"]
+            instances.append(inst)
         audit_events = self.repo.get_all_audit_events()
         daily_report_md = generate_daily_compliance_report_markdown(self.repo, backup_date)
 
@@ -222,18 +245,18 @@ class HetznerS3BreakGlassManager:
                 verified_at_iso=now_iso,
             )
 
-        # Spin up isolated ephemeral database instance for Break-Glass restore
-        temp_repo = ComplianceRepository(":memory:")
+        # Spin up isolated ephemeral PostgreSQL schema for Break-Glass restore
+        temp_repo = ComplianceRepository()
         try:
             tables = snapshot["tables"]
-            with temp_repo.conn:
+            with temp_repo.conn.transaction():
                 for u in tables["users_rbac"]:
                     temp_repo.conn.execute(
                         """
                         INSERT INTO users_rbac (
                             user_id, entra_oid, slack_user_id, full_name, email,
                             staff_role, gphc_reg_number, is_active, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             u["user_id"],
@@ -243,7 +266,7 @@ class HetznerS3BreakGlassManager:
                             u["email"],
                             u["staff_role"],
                             u["gphc_reg_number"],
-                            u["is_active"],
+                            bool(u["is_active"]),
                             u["created_at"],
                         ),
                     )
@@ -255,7 +278,7 @@ class HetznerS3BreakGlassManager:
                             task_id, task_name, frequency, daily_timing_window,
                             assigned_role, original_role_label,
                             requires_structured_input, input_schema, is_active
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                         """,
                         (
                             t["task_id"],
@@ -264,9 +287,9 @@ class HetznerS3BreakGlassManager:
                             t["daily_timing_window"],
                             t["assigned_role"],
                             t["original_role_label"],
-                            t["requires_structured_input"],
-                            t["input_schema"],
-                            t["is_active"],
+                            bool(t["requires_structured_input"]),
+                            t["input_schema"] if isinstance(t["input_schema"], str) else canonical_json(t["input_schema"]),
+                            bool(t["is_active"]),
                         ),
                     )
 
@@ -279,7 +302,7 @@ class HetznerS3BreakGlassManager:
                             status, completed_by_user_id, completed_at,
                             structured_data, notes, escalation_count,
                             last_reminded_at, slack_channel_id, slack_message_ts, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             inst["instance_id"],
@@ -290,7 +313,7 @@ class HetznerS3BreakGlassManager:
                             inst["status"],
                             inst["completed_by_user_id"],
                             inst["completed_at"],
-                            inst["structured_data"],
+                            inst["structured_data"] if isinstance(inst["structured_data"], str) else canonical_json(inst["structured_data"]),
                             inst["notes"],
                             inst["escalation_count"],
                             inst["last_reminded_at"],
@@ -307,7 +330,7 @@ class HetznerS3BreakGlassManager:
                             audit_seq, event_id, event_type, task_id, instance_id,
                             period_key, actor_user_id, actor_slack_id, actor_entra_oid,
                             actor_role, payload, occurred_at, prev_hash, row_hash
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
                         """,
                         (
                             ev["audit_seq"],
@@ -320,7 +343,7 @@ class HetznerS3BreakGlassManager:
                             ev["actor_slack_id"],
                             ev["actor_entra_oid"],
                             ev["actor_role"],
-                            ev["payload"],
+                            ev["payload"] if isinstance(ev["payload"], str) else canonical_json(ev["payload"]),
                             ev["occurred_at"],
                             ev["prev_hash"],
                             ev["row_hash"],
@@ -328,13 +351,13 @@ class HetznerS3BreakGlassManager:
                     )
 
             restored_tasks = int(
-                temp_repo.conn.execute("SELECT COUNT(*) FROM tasks_master").fetchone()[0]
+                temp_repo.conn.execute("SELECT COUNT(*) AS cnt FROM tasks_master").fetchone()["cnt"]
             )
             restored_instances = int(
-                temp_repo.conn.execute("SELECT COUNT(*) FROM task_instances").fetchone()[0]
+                temp_repo.conn.execute("SELECT COUNT(*) AS cnt FROM task_instances").fetchone()["cnt"]
             )
             restored_audits = int(
-                temp_repo.conn.execute("SELECT COUNT(*) FROM task_events_audit").fetchone()[0]
+                temp_repo.conn.execute("SELECT COUNT(*) AS cnt FROM task_events_audit").fetchone()["cnt"]
             )
             chain_check = temp_repo.verify_ledger_integrity()
 
@@ -375,7 +398,7 @@ class HetznerS3BreakGlassManager:
         error_details: Optional[str],
         verified_at_iso: str,
     ) -> BreakGlassVerificationReport:
-        with self.repo.conn:
+        with self.repo.conn.transaction():
             self.repo.conn.execute(
                 """
                 INSERT INTO backup_verification_logs (
@@ -383,7 +406,7 @@ class HetznerS3BreakGlassManager:
                     archive_sha256, encryption_cipher, restored_task_count,
                     restored_audit_count, hash_chain_valid, verification_status,
                     error_details, verified_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     verification_id,
@@ -394,7 +417,7 @@ class HetznerS3BreakGlassManager:
                     CIPHER_IDENTIFIER,
                     restored_task_count,
                     restored_audit_count,
-                    1 if hash_chain_valid else 0,
+                    bool(hash_chain_valid),
                     status,
                     error_details,
                     verified_at_iso,

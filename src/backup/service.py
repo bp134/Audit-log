@@ -18,7 +18,7 @@ def run_nightly_backup_and_verify(
     staging_dir: Path | None = None,
 ) -> None:
     cfg = config or AppConfig()
-    repo = ComplianceRepository(cfg.sqlite_fallback_path)
+    repo = ComplianceRepository(cfg.database_url)
     repo.seed_tasks_from_sql_file()
 
     vault_dir = staging_dir or Path("/app/s3_vault")

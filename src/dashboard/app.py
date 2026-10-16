@@ -35,7 +35,7 @@ def render_streamlit_dashboard() -> None:
     )
 
     cfg = AppConfig()
-    repo = ComplianceRepository(cfg.sqlite_fallback_path)
+    repo = ComplianceRepository(cfg.database_url)
     repo.seed_tasks_from_sql_file()
 
     # ID-021: Gate demo staff seeding strictly behind ENV=development

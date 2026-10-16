@@ -19,7 +19,7 @@ logger = logging.getLogger("pharmacy_compliance.slack_service")
 
 def create_slack_runtime(config: AppConfig | None = None) -> tuple[ComplianceRepository, SlackComplianceHandler, TrancheSchedulerEngine]:
     cfg = config or AppConfig()
-    repo = ComplianceRepository(cfg.sqlite_fallback_path)
+    repo = ComplianceRepository(cfg.database_url)
     repo.seed_tasks_from_sql_file()
     handler = SlackComplianceHandler(repo)
     scheduler = TrancheSchedulerEngine(repo)

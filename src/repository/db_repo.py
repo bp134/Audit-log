@@ -1,23 +1,28 @@
 """
-Compliance Repository supporting both Azure PostgreSQL Flexible Server (via psycopg)
-and a self-contained SQLite engine with equivalent immutability triggers and SHA-256 hash chaining.
+PostgreSQL-Only Compliance Repository (`src/repository/db_repo.py`).
+Routes all operations exclusively through PostgreSQL (`psycopg`) via `DATABASE_URL` (ID-002),
+executes `db/01_schema.sql` and `db/02_seed_tasks.sql` as the single canonical schema/seed source (ID-017),
+enforces database-layer SHA-256 hash chaining and immutability triggers (ID-008, ID-010, ID-022),
+and uses optimistic locking on concurrent task completions (ID-009).
+Zero SQLite dependencies remain anywhere in this module (ID-016).
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
 import json
+import os
 from pathlib import Path
-import re
-import sqlite3
 from typing import Any, Optional
 import uuid
 
+import psycopg
+from psycopg.rows import dict_row
+
 from src.domain.ledger import (
-    GENESIS_PREV_HASH,
     LedgerVerificationResult,
     canonical_json,
-    compute_audit_row_hash,
+    format_canonical_utc_timestamp,
     verify_audit_chain,
 )
 from src.domain.models import (
@@ -29,12 +34,13 @@ from src.domain.models import (
     StaffRole,
     TaskFrequency,
     TaskInstanceRecord,
-    TaskMasterRecord,
     UserRecord,
     compute_period_bounds,
     is_role_authorized,
     validate_fridge_reading,
 )
+
+DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/pharmacy_compliance_test"
 
 
 class ImmutableLedgerViolationError(PermissionError):
@@ -43,221 +49,90 @@ class ImmutableLedgerViolationError(PermissionError):
 
 class ComplianceRepository:
     """
-    Unified compliance repository providing:
-    - Master task seeding (all 33 pharmacy tasks)
+    PostgreSQL-exclusive compliance repository providing:
+    - Master task seeding directly from `db/02_seed_tasks.sql` (all 33 pharmacy tasks)
     - RBAC user management (Entra OID <-> Slack ID <-> Pharmacy Role)
     - Period instance scheduling (Daily, Weekly any-day, Monthly any-day)
-    - Role-enforced task completion & Fridge temperature modal logging
-    - Append-only, database-trigger-protected, SHA-256 hash-chained audit trail
+    - Role-enforced task completion with optimistic locking & Fridge temperature modal logging
+    - Append-only, PostgreSQL-trigger-enforced, SHA-256 hash-chained audit trail
+    - Live read-only inspection of Azure PostgreSQL `task_reminders` (`tasks_master`, `scheduled_instances`, `audit_logs`)
     """
 
-    def __init__(self, db_path: str = ":memory:") -> None:
-        self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON;")
-        self._init_schema_and_immutability_triggers()
+    def __init__(
+        self,
+        database_url: Optional[str] = None,
+        *,
+        schema_name: Optional[str] = None,
+        init_schema: bool = True,
+    ) -> None:
+        # If legacy test callers pass ":memory:" or a `.db` file path, route to an isolated PostgreSQL test schema
+        if database_url is None or database_url == ":memory:" or not str(database_url).startswith("postgresql"):
+            self.database_url = os.getenv("TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
+            self._ephemeral_schema = schema_name or f"test_pg_{uuid.uuid4().hex[:12]}"
+            self._drop_schema_on_close = schema_name is None
+        else:
+            self.database_url = database_url
+            self._ephemeral_schema = schema_name
+            self._drop_schema_on_close = False
+
+        self.conn = psycopg.connect(self.database_url, row_factory=dict_row, autocommit=True)
+        if self._ephemeral_schema:
+            with self.conn.transaction():
+                self.conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self._ephemeral_schema}";')
+            self.conn.execute(f'SET search_path TO "{self._ephemeral_schema}", public;')
+
+        if init_schema:
+            self._init_schema_and_immutability_triggers()
 
     def _init_schema_and_immutability_triggers(self) -> None:
-        with self.conn:
-            self.conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users_rbac (
-                    user_id         TEXT PRIMARY KEY,
-                    entra_oid       TEXT UNIQUE NOT NULL,
-                    slack_user_id   TEXT UNIQUE NOT NULL,
-                    full_name       TEXT NOT NULL,
-                    email           TEXT UNIQUE NOT NULL,
-                    staff_role      TEXT NOT NULL CHECK (staff_role IN ('Pharm', 'Dispenser', 'Manager')),
-                    gphc_reg_number TEXT,
-                    is_active       INTEGER NOT NULL DEFAULT 1,
-                    created_at      TEXT NOT NULL,
-                    CHECK (staff_role <> 'Pharm' OR (gphc_reg_number IS NOT NULL AND length(trim(gphc_reg_number)) >= 6))
-                );
-
-                CREATE TABLE IF NOT EXISTS tasks_master (
-                    task_id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_name                   TEXT UNIQUE NOT NULL,
-                    frequency                   TEXT NOT NULL CHECK (frequency IN ('Daily', 'Weekly', 'Monthly')),
-                    daily_timing_window         TEXT CHECK (daily_timing_window IN ('Morning', 'Anytime', 'End_Of_Day') OR daily_timing_window IS NULL),
-                    assigned_role               TEXT NOT NULL CHECK (assigned_role IN ('Pharm', 'Dispenser', 'Either')),
-                    original_role_label         TEXT NOT NULL,
-                    requires_structured_input   INTEGER NOT NULL DEFAULT 0,
-                    input_schema                TEXT NOT NULL DEFAULT '{}',
-                    is_active                   INTEGER NOT NULL DEFAULT 1,
-                    CHECK (
-                        (frequency = 'Daily' AND daily_timing_window IS NOT NULL)
-                        OR (frequency IN ('Weekly', 'Monthly') AND daily_timing_window IS NULL)
-                    )
-                );
-
-                CREATE TABLE IF NOT EXISTS task_instances (
-                    instance_id             TEXT PRIMARY KEY,
-                    task_id                 INTEGER NOT NULL REFERENCES tasks_master(task_id),
-                    period_key              TEXT NOT NULL,
-                    period_start_date       TEXT NOT NULL,
-                    period_end_date         TEXT NOT NULL,
-                    status                  TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Completed', 'Escalated', 'Missed')),
-                    completed_by_user_id    TEXT REFERENCES users_rbac(user_id),
-                    completed_at            TEXT,
-                    structured_data         TEXT NOT NULL DEFAULT '{}',
-                    notes                   TEXT,
-                    escalation_count        INTEGER NOT NULL DEFAULT 0,
-                    last_reminded_at        TEXT,
-                    slack_channel_id        TEXT,
-                    slack_message_ts        TEXT,
-                    created_at              TEXT NOT NULL,
-                    UNIQUE (task_id, period_key)
-                );
-
-                CREATE TABLE IF NOT EXISTS task_events_audit (
-                    audit_seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id        TEXT UNIQUE NOT NULL,
-                    event_type      TEXT NOT NULL,
-                    task_id         INTEGER REFERENCES tasks_master(task_id),
-                    instance_id     TEXT REFERENCES task_instances(instance_id),
-                    period_key      TEXT,
-                    actor_user_id   TEXT REFERENCES users_rbac(user_id),
-                    actor_slack_id  TEXT,
-                    actor_entra_oid TEXT,
-                    actor_role      TEXT,
-                    payload         TEXT NOT NULL DEFAULT '{}',
-                    occurred_at     TEXT NOT NULL,
-                    prev_hash       TEXT NOT NULL,
-                    row_hash        TEXT UNIQUE NOT NULL
-                );
-
-                -- Database-level immutability triggers blocking UPDATE and DELETE on task_events_audit
-                CREATE TRIGGER IF NOT EXISTS trg_prevent_audit_update
-                BEFORE UPDATE ON task_events_audit
-                BEGIN
-                    SELECT RAISE(ABORT, 'COMPLIANCE VIOLATION: task_events_audit is strictly append-only. Operation UPDATE is prohibited.');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS trg_prevent_audit_delete
-                BEFORE DELETE ON task_events_audit
-                BEGIN
-                    SELECT RAISE(ABORT, 'COMPLIANCE VIOLATION: task_events_audit is strictly append-only. Operation DELETE is prohibited.');
-                END;
-
-                CREATE TABLE IF NOT EXISTS backup_verification_logs (
-                    verification_id     TEXT PRIMARY KEY,
-                    backup_date         TEXT NOT NULL,
-                    s3_bucket           TEXT NOT NULL,
-                    s3_object_key       TEXT NOT NULL,
-                    archive_sha256      TEXT NOT NULL,
-                    encryption_cipher   TEXT NOT NULL,
-                    restored_task_count INTEGER NOT NULL,
-                    restored_audit_count INTEGER NOT NULL,
-                    hash_chain_valid    INTEGER NOT NULL,
-                    verification_status TEXT NOT NULL CHECK (verification_status IN ('PASSED', 'FAILED')),
-                    error_details       TEXT,
-                    verified_at         TEXT NOT NULL
-                );
-                """
-            )
+        schema_sql_path = Path(__file__).resolve().parents[2] / "db" / "01_schema.sql"
+        sql_text = schema_sql_path.read_text(encoding="utf-8")
+        cleaned_lines = [
+            line for line in sql_text.splitlines() if line.strip().upper() not in ("BEGIN;", "COMMIT;")
+        ]
+        with self.conn.transaction():
+            if self._ephemeral_schema:
+                self.conn.execute(f'SET search_path TO "{self._ephemeral_schema}", public;')
+            self.conn.execute("\n".join(cleaned_lines))
 
     def seed_tasks_from_sql_file(self, sql_seed_path: Optional[Path] = None) -> int:
         """
-        Loads and seeds the 33 normalized tasks from `db/02_seed_tasks.sql`.
-        Returns the total count of active tasks in `tasks_master`.
+        ID-017: Loads and executes `db/02_seed_tasks.sql` directly against PostgreSQL
+        as the single canonical source of truth for all 33 pharmacy compliance tasks.
         """
         if sql_seed_path is None:
             sql_seed_path = Path(__file__).resolve().parents[2] / "db" / "02_seed_tasks.sql"
 
-        tasks_data = [
-            # Daily - Morning (4)
-            (
-                "Fridge Check (Min/Max/Current)",
-                "Daily",
-                "Morning",
-                "Either",
-                "Dispenser / Pharm",
-                True,
-                {
-                    "type": "fridge_temperature",
-                    "fields": ["min_temp_c", "max_temp_c", "current_temp_c"],
-                    "safe_min_c": 2.0,
-                    "safe_max_c": 8.0,
-                    "require_action_note_if_out_of_range": True,
-                },
-            ),
-            ("Handover & Diary Review", "Daily", "Morning", "Either", "Pharm / Dispenser", False, {}),
-            ("EPS & NHSmail Download", "Daily", "Morning", "Either", "Dispenser / Pharm", False, {}),
-            ("Till Prep & Float", "Daily", "Morning", "Dispenser", "Dispenser", False, {}),
-            # Daily - Anytime (5)
-            ("Prescription Processing", "Daily", "Anytime", "Dispenser", "Dispenser", False, {}),
-            ("MDS/Dosette Boxes Prep & Check", "Daily", "Anytime", "Either", "Dispenser / Pharm", False, {}),
-            ("Owings Processing", "Daily", "Anytime", "Dispenser", "Dispenser", False, {}),
-            ("Deliveries & Fridge Lines", "Daily", "Anytime", "Dispenser", "Dispenser", False, {}),
-            ("Clinical Services Prep", "Daily", "Anytime", "Pharm", "Pharm", False, {}),
-            # Daily - End_Of_Day (5)
-            ("CD Register Reconcile", "Daily", "End_Of_Day", "Pharm", "Pharm", False, {}),
-            ("EPS Claims (End of Day)", "Daily", "End_Of_Day", "Either", "Dispenser / Pharm", False, {}),
-            ("Information Governance Secure", "Daily", "End_Of_Day", "Dispenser", "Dispenser", False, {}),
-            ("Housekeeping (Benches/Bins/Floor)", "Daily", "End_Of_Day", "Dispenser", "Dispenser", False, {}),
-            ("Security & Lock Up", "Daily", "End_Of_Day", "Pharm", "Pharm", False, {}),
-            # Weekly (10)
-            ("Full CD Balance Check", "Weekly", None, "Pharm", "Pharm", False, {}),
-            ("Owings Audit & Chase", "Weekly", None, "Dispenser", "Dispenser", False, {}),
-            ("Uncollected Scripts (14+ Days)", "Weekly", None, "Dispenser", "Dispenser", False, {}),
-            ("Consumables Order", "Weekly", None, "Dispenser", "Dispenser", False, {}),
-            ("Filing (Invoices & Logs)", "Weekly", None, "Dispenser", "Dispenser", False, {}),
-            ("Rota Check", "Weekly", None, "Pharm", "Pharm", False, {}),
-            ("Collection Box Audit", "Weekly", None, "Dispenser", "Dispenser", False, {}),
-            ("Consultation Room Deep Clean", "Weekly", None, "Either", "Dispenser / Pharm", False, {}),
-            ("Hardware Antibacterial Clean", "Weekly", None, "Dispenser", "Dispenser", False, {}),
-            ("Retail Area Face Up & Mop", "Weekly", None, "Dispenser", "Dispenser", False, {}),
-            # Monthly (9)
-            ("Date Checking Matrix", "Monthly", None, "Dispenser", "Dispenser", False, {}),
-            ("CD Management (Out of Date)", "Monthly", None, "Pharm", "Pharm", False, {}),
-            ("Fridge Audit & Defrost", "Monthly", None, "Dispenser", "Dispenser", False, {}),
-            ("End of Month (NHSBSA / FP34C)", "Monthly", None, "Either", "Dispenser / Pharm", False, {}),
-            ("Service Claims (MYS/Local)", "Monthly", None, "Pharm", "Pharm", False, {}),
-            ("SOP & Training Review", "Monthly", None, "Pharm", "Pharm", False, {}),
-            ("Health & Safety (Fire/First Aid)", "Monthly", None, "Either", "Pharm / Dispenser", False, {}),
-            ("Staff Areas Deep Clean", "Monthly", None, "Dispenser", "Dispenser", False, {}),
-            ("Ventilation & Hardware Dusting", "Monthly", None, "Dispenser", "Dispenser", False, {}),
+        sql_text = sql_seed_path.read_text(encoding="utf-8")
+        cleaned_lines = [
+            line for line in sql_text.splitlines() if line.strip().upper() not in ("BEGIN;", "COMMIT;")
         ]
+        with self.conn.transaction():
+            self.conn.execute("\n".join(cleaned_lines))
 
-        with self.conn:
-            for (
-                name,
-                freq,
-                window,
-                role,
-                orig_label,
-                req_struct,
-                schema_dict,
-            ) in tasks_data:
-                self.conn.execute(
-                    """
-                    INSERT INTO tasks_master (
-                        task_name, frequency, daily_timing_window,
-                        assigned_role, original_role_label,
-                        requires_structured_input, input_schema
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(task_name) DO UPDATE SET
-                        frequency = excluded.frequency,
-                        daily_timing_window = excluded.daily_timing_window,
-                        assigned_role = excluded.assigned_role,
-                        original_role_label = excluded.original_role_label,
-                        requires_structured_input = excluded.requires_structured_input,
-                        input_schema = excluded.input_schema
-                    """,
-                    (
-                        name,
-                        freq,
-                        window,
-                        role,
-                        orig_label,
-                        1 if req_struct else 0,
-                        canonical_json(schema_dict),
-                    ),
-                )
+        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks_master WHERE is_active = TRUE").fetchone()
+        return int(row["cnt"]) if row else 0
 
-        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM tasks_master WHERE is_active = 1").fetchone()
-        return int(row["cnt"])
+    # -------------------------------------------------------------------------
+    # Live Azure `task_reminders` Read-Only Inspection Adapter
+    # -------------------------------------------------------------------------
+    def fetch_live_task_reminders_counts(self) -> dict[str, int]:
+        """
+        Queries the live Azure PostgreSQL `task_reminders` schema (`tasks_master`,
+        `scheduled_instances`, `audit_logs`) strictly read-only (`SELECT` only).
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM public.tasks_master;")
+            tasks_cnt = int((cur.fetchone() or {"cnt": 0})["cnt"])
+            cur.execute("SELECT COUNT(*) AS cnt FROM public.scheduled_instances;")
+            sched_cnt = int((cur.fetchone() or {"cnt": 0})["cnt"])
+            cur.execute("SELECT COUNT(*) AS cnt FROM public.audit_logs;")
+            audit_cnt = int((cur.fetchone() or {"cnt": 0})["cnt"])
+        return {
+            "tasks_master": tasks_cnt,
+            "scheduled_instances": sched_cnt,
+            "audit_logs": audit_cnt,
+        }
 
     # -------------------------------------------------------------------------
     # User & RBAC Operations
@@ -275,19 +150,20 @@ class ComplianceRepository:
     ) -> UserRecord:
         uid = user_id or str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        with self.conn:
+        with self.conn.transaction():
             self.conn.execute(
                 """
                 INSERT INTO users_rbac (
                     user_id, entra_oid, slack_user_id, full_name, email,
                     staff_role, gphc_reg_number, is_active, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s)
                 ON CONFLICT(slack_user_id) DO UPDATE SET
-                    entra_oid = excluded.entra_oid,
-                    full_name = excluded.full_name,
-                    email = excluded.email,
-                    staff_role = excluded.staff_role,
-                    gphc_reg_number = excluded.gphc_reg_number
+                    entra_oid = EXCLUDED.entra_oid,
+                    full_name = EXCLUDED.full_name,
+                    email = EXCLUDED.email,
+                    staff_role = EXCLUDED.staff_role,
+                    gphc_reg_number = EXCLUDED.gphc_reg_number,
+                    updated_at = NOW()
                 """,
                 (
                     uid,
@@ -304,13 +180,13 @@ class ComplianceRepository:
 
     def get_user_by_slack_id(self, slack_user_id: str) -> Optional[UserRecord]:
         row = self.conn.execute(
-            "SELECT * FROM users_rbac WHERE slack_user_id = ? AND is_active = 1",
+            "SELECT * FROM users_rbac WHERE slack_user_id = %s AND is_active = TRUE",
             (slack_user_id,),
         ).fetchone()
         if not row:
             return None
         return UserRecord(
-            user_id=row["user_id"],
+            user_id=str(row["user_id"]),
             entra_oid=row["entra_oid"],
             slack_user_id=row["slack_user_id"],
             full_name=row["full_name"],
@@ -322,13 +198,13 @@ class ComplianceRepository:
 
     def get_user_by_entra_oid(self, entra_oid: str) -> Optional[UserRecord]:
         row = self.conn.execute(
-            "SELECT * FROM users_rbac WHERE entra_oid = ? AND is_active = 1",
+            "SELECT * FROM users_rbac WHERE entra_oid = %s AND is_active = TRUE",
             (entra_oid,),
         ).fetchone()
         if not row:
             return None
         return UserRecord(
-            user_id=row["user_id"],
+            user_id=str(row["user_id"]),
             entra_oid=row["entra_oid"],
             slack_user_id=row["slack_user_id"],
             full_name=row["full_name"],
@@ -339,10 +215,10 @@ class ComplianceRepository:
         )
 
     def list_users(self) -> list[UserRecord]:
-        rows = self.conn.execute("SELECT * FROM users_rbac WHERE is_active = 1 ORDER BY full_name").fetchall()
+        rows = self.conn.execute("SELECT * FROM users_rbac WHERE is_active = TRUE ORDER BY full_name").fetchall()
         return [
             UserRecord(
-                user_id=r["user_id"],
+                user_id=str(r["user_id"]),
                 entra_oid=r["entra_oid"],
                 slack_user_id=r["slack_user_id"],
                 full_name=r["full_name"],
@@ -355,7 +231,7 @@ class ComplianceRepository:
         ]
 
     # -------------------------------------------------------------------------
-    # Immutable Audit Event Writer
+    # Immutable Audit Event Writer (Database-Layer Hash Computation - ID-010)
     # -------------------------------------------------------------------------
     def append_audit_event(
         self,
@@ -370,46 +246,30 @@ class ComplianceRepository:
         occurred_at: Optional[datetime] = None,
     ) -> dict[str, Any]:
         """
-        Appends an event to `task_events_audit` with deterministic SHA-256 hash chaining.
+        ID-010: Inserts an audit event into PostgreSQL `task_events_audit` WITHOUT
+        client-computed hashes. The PostgreSQL `BEFORE INSERT` trigger
+        `fn_audit_compute_hash_chain()` computes `prev_hash` and `row_hash` inside
+        the database engine using `fn_canonical_jsonb()` and `pg_advisory_xact_lock()`.
         """
         event_id = str(uuid.uuid4())
         ts = occurred_at or datetime.now(timezone.utc)
         occurred_at_iso = ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         payload_dict = payload or {}
 
-        with self.conn:
-            last_row = self.conn.execute(
-                "SELECT row_hash FROM task_events_audit ORDER BY audit_seq DESC LIMIT 1"
-            ).fetchone()
-            prev_hash = last_row["row_hash"] if last_row else GENESIS_PREV_HASH
+        actor_uid = actor.user_id if actor else None
+        actor_slack = actor.slack_user_id if actor else actor_slack_id_override
+        actor_entra = actor.entra_oid if actor else None
+        actor_role = actor.staff_role.value if actor else None
 
-            actor_uid = actor.user_id if actor else None
-            actor_slack = actor.slack_user_id if actor else actor_slack_id_override
-            actor_entra = actor.entra_oid if actor else None
-            actor_role = actor.staff_role.value if actor else None
-
-            row_hash = compute_audit_row_hash(
-                event_id=event_id,
-                event_type=event_type.value,
-                task_id=task_id,
-                instance_id=instance_id,
-                period_key=period_key,
-                actor_user_id=actor_uid,
-                actor_slack_id=actor_slack,
-                actor_entra_oid=actor_entra,
-                actor_role=actor_role,
-                payload=payload_dict,
-                occurred_at_iso=occurred_at_iso,
-                prev_hash=prev_hash,
-            )
-
-            cursor = self.conn.execute(
+        with self.conn.transaction():
+            row = self.conn.execute(
                 """
                 INSERT INTO task_events_audit (
                     event_id, event_type, task_id, instance_id, period_key,
                     actor_user_id, actor_slack_id, actor_entra_oid, actor_role,
                     payload, occurred_at, prev_hash, row_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, '', '')
+                RETURNING audit_seq, event_id, event_type, prev_hash, row_hash, occurred_at
                 """,
                 (
                     event_id,
@@ -423,31 +283,26 @@ class ComplianceRepository:
                     actor_role,
                     canonical_json(payload_dict),
                     occurred_at_iso,
-                    prev_hash,
-                    row_hash,
                 ),
-            )
+            ).fetchone()
+
+            if row is None:
+                raise RuntimeError("PostgreSQL INSERT RETURNING on task_events_audit returned no row.")
             return {
-                "audit_seq": cursor.lastrowid,
-                "event_id": event_id,
-                "event_type": event_type.value,
-                "prev_hash": prev_hash,
-                "row_hash": row_hash,
-                "occurred_at": occurred_at_iso,
+                "audit_seq": int(row["audit_seq"]),
+                "event_id": str(row["event_id"]),
+                "event_type": str(row["event_type"]),
+                "prev_hash": str(row["prev_hash"]),
+                "row_hash": str(row["row_hash"]),
+                "occurred_at": format_canonical_utc_timestamp(row["occurred_at"]),
             }
 
     # -------------------------------------------------------------------------
     # Cycle Scheduling (Daily / Weekly / Monthly)
     # -------------------------------------------------------------------------
     def ensure_instances_for_date(self, target_date: date) -> list[TaskInstanceRecord]:
-        """
-        Idempotently ensures task instances exist for `target_date`:
-        - 14 Daily tasks for `YYYY-MM-DD`
-        - 10 Weekly tasks for `YYYY-Www` (created once per week; remains open across all days of the week until completed once)
-        - 9 Monthly tasks for `YYYY-MM` (created once per month; remains open across all days of the month until completed once)
-        """
         master_rows = self.conn.execute(
-            "SELECT * FROM tasks_master WHERE is_active = 1 ORDER BY task_id"
+            "SELECT * FROM tasks_master WHERE is_active = TRUE ORDER BY task_id"
         ).fetchall()
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -456,20 +311,20 @@ class ComplianceRepository:
             bounds = compute_period_bounds(freq, target_date)
 
             existing = self.conn.execute(
-                "SELECT instance_id FROM task_instances WHERE task_id = ? AND period_key = ?",
+                "SELECT instance_id FROM task_instances WHERE task_id = %s AND period_key = %s",
                 (m["task_id"], bounds.period_key),
             ).fetchone()
 
             if not existing:
                 instance_id = str(uuid.uuid4())
-                with self.conn:
+                with self.conn.transaction():
                     self.conn.execute(
                         """
                         INSERT INTO task_instances (
                             instance_id, task_id, period_key,
                             period_start_date, period_end_date,
                             status, created_at
-                        ) VALUES (?, ?, ?, ?, ?, 'Pending', ?)
+                        ) VALUES (%s, %s, %s, %s, %s, 'Pending', %s)
                         """,
                         (
                             instance_id,
@@ -497,10 +352,6 @@ class ComplianceRepository:
         return self.get_active_instances_for_date(target_date)
 
     def get_active_instances_for_date(self, target_date: date) -> list[TaskInstanceRecord]:
-        """
-        Returns all Daily instances for `target_date`, Weekly instances for `target_date`'s week,
-        and Monthly instances for `target_date`'s month.
-        """
         daily_key = compute_period_bounds(TaskFrequency.DAILY, target_date).period_key
         weekly_key = compute_period_bounds(TaskFrequency.WEEKLY, target_date).period_key
         monthly_key = compute_period_bounds(TaskFrequency.MONTHLY, target_date).period_key
@@ -519,7 +370,7 @@ class ComplianceRepository:
             FROM task_instances ti
             JOIN tasks_master tm ON tm.task_id = ti.task_id
             LEFT JOIN users_rbac u ON u.user_id = ti.completed_by_user_id
-            WHERE ti.period_key IN (?, ?, ?)
+            WHERE ti.period_key IN (%s, %s, %s)
             ORDER BY tm.task_id ASC
             """,
             (daily_key, weekly_key, monthly_key),
@@ -542,15 +393,27 @@ class ComplianceRepository:
             FROM task_instances ti
             JOIN tasks_master tm ON tm.task_id = ti.task_id
             LEFT JOIN users_rbac u ON u.user_id = ti.completed_by_user_id
-            WHERE ti.instance_id = ?
+            WHERE ti.instance_id = %s
             """,
             (instance_id,),
         ).fetchone()
         return self._row_to_instance(row) if row else None
 
-    def _row_to_instance(self, r: sqlite3.Row) -> TaskInstanceRecord:
+    def _row_to_instance(self, r: dict[str, Any]) -> TaskInstanceRecord:
+        p_start = r["period_start_date"]
+        p_end = r["period_end_date"]
+        comp_at = r["completed_at"]
+        struct_data = r["structured_data"]
+        if isinstance(struct_data, str):
+            struct_data = json.loads(struct_data or "{}")
+        elif struct_data is None:
+            struct_data = {}
+
+        if isinstance(comp_at, str):
+            comp_at = datetime.fromisoformat(comp_at.replace("Z", "+00:00"))
+
         return TaskInstanceRecord(
-            instance_id=r["instance_id"],
+            instance_id=str(r["instance_id"]),
             task_id=int(r["task_id"]),
             task_name=r["task_name"],
             frequency=TaskFrequency(r["frequency"]),
@@ -558,22 +421,20 @@ class ComplianceRepository:
             assigned_role=RoleRequirement(r["assigned_role"]),
             requires_structured_input=bool(r["requires_structured_input"]),
             period_key=r["period_key"],
-            period_start_date=date.fromisoformat(r["period_start_date"]),
-            period_end_date=date.fromisoformat(r["period_end_date"]),
+            period_start_date=p_start if isinstance(p_start, date) else date.fromisoformat(str(p_start)),
+            period_end_date=p_end if isinstance(p_end, date) else date.fromisoformat(str(p_end)),
             status=InstanceStatus(r["status"]),
-            completed_by_user_id=r["completed_by_user_id"],
+            completed_by_user_id=str(r["completed_by_user_id"]) if r["completed_by_user_id"] else None,
             completed_by_name=r["completed_by_name"],
             completed_by_role=r["completed_by_role"],
-            completed_at=datetime.fromisoformat(r["completed_at"].replace("Z", "+00:00"))
-            if r["completed_at"]
-            else None,
-            structured_data=json.loads(r["structured_data"] or "{}"),
+            completed_at=comp_at,
+            structured_data=struct_data,
             notes=r["notes"],
             escalation_count=int(r["escalation_count"]),
         )
 
     # -------------------------------------------------------------------------
-    # Task Completion & Fridge Temperature Logging (with Strict RBAC Enforcement)
+    # Task Completion & Fridge Temperature Logging (with Optimistic Locking - ID-009)
     # -------------------------------------------------------------------------
     def complete_task_instance(
         self,
@@ -584,13 +445,6 @@ class ComplianceRepository:
         fridge_readings: Optional[dict[str, float]] = None,
         completed_at: Optional[datetime] = None,
     ) -> tuple[bool, str, Optional[TaskInstanceRecord]]:
-        """
-        Completes a task instance if and only if:
-        1. Actor is a registered active user in `users_rbac`.
-        2. Actor's `staff_role` satisfies the task's `assigned_role` (RBAC).
-        3. If the task requires structured input (Fridge Check), `fridge_readings` are present and valid.
-        Every attempt (including denied RBAC attempts and out-of-range fridge readings) is logged to `task_events_audit`.
-        """
         instance = self.get_instance_by_id(instance_id)
         if not instance:
             return False, f"Task instance `{instance_id}` not found.", None
@@ -686,16 +540,17 @@ class ComplianceRepository:
         ts = completed_at or datetime.now(timezone.utc)
         completed_iso = ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-        with self.conn:
-            self.conn.execute(
+        # ID-009: Optimistic locking — enforce status != 'Completed' in the UPDATE predicate
+        with self.conn.transaction():
+            cur = self.conn.execute(
                 """
                 UPDATE task_instances
                 SET status = 'Completed',
-                    completed_by_user_id = ?,
-                    completed_at = ?,
-                    structured_data = ?,
-                    notes = ?
-                WHERE instance_id = ?
+                    completed_by_user_id = %s,
+                    completed_at = %s,
+                    structured_data = %s::jsonb,
+                    notes = %s
+                WHERE instance_id = %s AND status <> 'Completed'
                 """,
                 (
                     actor.user_id,
@@ -705,6 +560,13 @@ class ComplianceRepository:
                     instance.instance_id,
                 ),
             )
+            if cur.rowcount == 0:
+                refreshed = self.get_instance_by_id(instance.instance_id)
+                return (
+                    False,
+                    f"Conflict: *{instance.task_name}* was concurrently completed by another user.",
+                    refreshed,
+                )
 
         audit_type = (
             AuditEventType.FRIDGE_TEMP_LOGGED
@@ -744,13 +606,13 @@ class ComplianceRepository:
             inst = self.get_instance_by_id(iid)
             if not inst or inst.status == InstanceStatus.COMPLETED:
                 continue
-            with self.conn:
+            with self.conn.transaction():
                 self.conn.execute(
                     """
                     UPDATE task_instances
                     SET status = 'Escalated',
                         escalation_count = escalation_count + 1
-                    WHERE instance_id = ?
+                    WHERE instance_id = %s AND status <> 'Completed'
                     """,
                     (iid,),
                 )
@@ -778,12 +640,27 @@ class ComplianceRepository:
         rows = self.conn.execute(
             "SELECT * FROM task_events_audit ORDER BY audit_seq ASC"
         ).fetchall()
-        return [dict(r) for r in rows]
+        normalized: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            item["audit_seq"] = int(item["audit_seq"])
+            item["event_id"] = str(item["event_id"])
+            item["event_type"] = str(item["event_type"])
+            item["instance_id"] = str(item["instance_id"]) if item["instance_id"] else None
+            item["actor_user_id"] = str(item["actor_user_id"]) if item["actor_user_id"] else None
+            item["occurred_at"] = format_canonical_utc_timestamp(item["occurred_at"])
+            item["prev_hash"] = str(item["prev_hash"]).strip()
+            item["row_hash"] = str(item["row_hash"]).strip()
+            normalized.append(item)
+        return normalized
 
     def verify_ledger_integrity(self) -> LedgerVerificationResult:
         rows = self.get_all_audit_events()
         return verify_audit_chain(rows)
 
     def close(self) -> None:
-        self.conn.close()
-
+        if not self.conn.closed:
+            if self._drop_schema_on_close and self._ephemeral_schema:
+                with self.conn.transaction():
+                    self.conn.execute(f'DROP SCHEMA IF EXISTS "{self._ephemeral_schema}" CASCADE;')
+            self.conn.close()

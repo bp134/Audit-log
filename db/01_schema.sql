@@ -7,35 +7,35 @@
 BEGIN;
 
 -- Required extension for SHA-256 cryptographic hashing inside PostgreSQL triggers
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
 
 -- -----------------------------------------------------------------------------
 -- 1. ENUMERATED TYPES
 -- -----------------------------------------------------------------------------
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'task_frequency') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'task_frequency' AND n.nspname = current_schema()) THEN
         CREATE TYPE task_frequency AS ENUM ('Daily', 'Weekly', 'Monthly');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'daily_window') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'daily_window' AND n.nspname = current_schema()) THEN
         CREATE TYPE daily_window AS ENUM ('Morning', 'Anytime', 'End_Of_Day');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'staff_role') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'staff_role' AND n.nspname = current_schema()) THEN
         CREATE TYPE staff_role AS ENUM ('Pharm', 'Dispenser', 'Manager');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'role_requirement') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'role_requirement' AND n.nspname = current_schema()) THEN
         -- Normalized from 'Pharm', 'Dispenser', 'Dispenser / Pharm', 'Pharm / Dispenser'
         CREATE TYPE role_requirement AS ENUM ('Pharm', 'Dispenser', 'Either');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'instance_status') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'instance_status' AND n.nspname = current_schema()) THEN
         CREATE TYPE instance_status AS ENUM ('Pending', 'Completed', 'Escalated', 'Missed');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'audit_event_type') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'audit_event_type' AND n.nspname = current_schema()) THEN
         CREATE TYPE audit_event_type AS ENUM (
             'INSTANCE_SCHEDULED',
             'REMINDER_DISPATCHED',
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS users_rbac (
     gphc_reg_number     VARCHAR(32),                   -- Mandatory for Pharmacists
     is_active           BOOLEAN NOT NULL DEFAULT TRUE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_pharmacist_gphc CHECK (
         staff_role <> 'Pharm' OR (gphc_reg_number IS NOT NULL AND length(trim(gphc_reg_number)) >= 6)
     )
@@ -147,6 +147,37 @@ CREATE INDEX IF NOT EXISTS idx_audit_occurred_at ON task_events_audit(occurred_a
 CREATE INDEX IF NOT EXISTS idx_audit_task_instance ON task_events_audit(task_id, instance_id);
 CREATE INDEX IF NOT EXISTS idx_audit_event_type ON task_events_audit(event_type);
 
+-- Helper Function: Canonical compact JSONB serialization (ID-008: sorted keys, no spaces after ':' or ',')
+-- Matches Python `json.dumps(payload, sort_keys=True, separators=(',', ':'))` byte-for-byte.
+CREATE OR REPLACE FUNCTION fn_canonical_jsonb(p_data JSONB)
+RETURNS TEXT
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_type TEXT;
+    v_result TEXT;
+BEGIN
+    IF p_data IS NULL THEN
+        RETURN '{}';
+    END IF;
+    v_type := jsonb_typeof(p_data);
+    IF v_type = 'object' THEN
+        SELECT '{' || COALESCE(string_agg(to_json(k)::text || ':' || fn_canonical_jsonb(v), ',' ORDER BY k COLLATE "C"), '') || '}'
+          INTO v_result
+          FROM jsonb_each(p_data) AS t(k, v);
+        RETURN v_result;
+    ELSIF v_type = 'array' THEN
+        SELECT '[' || COALESCE(string_agg(fn_canonical_jsonb(v), ','), '') || ']'
+          INTO v_result
+          FROM jsonb_array_elements(p_data) AS t(v);
+        RETURN v_result;
+    ELSE
+        RETURN p_data::text;
+    END IF;
+END;
+$$;
+
 -- Trigger Function 1: Compute deterministic SHA-256 hash chain on INSERT
 CREATE OR REPLACE FUNCTION fn_audit_compute_hash_chain()
 RETURNS TRIGGER
@@ -155,9 +186,11 @@ AS $$
 DECLARE
     v_last_hash CHAR(64);
     v_canonical_string TEXT;
+    v_computed_hash CHAR(64);
 BEGIN
-    -- Lock table in EXCLUSIVE mode during insert to guarantee strict sequential hash chaining
-    LOCK TABLE task_events_audit IN EXCLUSIVE MODE;
+    -- ID-022: Use transaction-scoped advisory lock so concurrent SELECTs
+    -- and compliance reports are never blocked by audit inserts.
+    PERFORM pg_advisory_xact_lock(20261015, 1);
 
     SELECT row_hash
       INTO v_last_hash
@@ -169,9 +202,15 @@ BEGIN
         v_last_hash := repeat('0', 64); -- Genesis block prev_hash
     END IF;
 
+    -- ID-010: Reject forged prev_hash if caller supplied one that does not match the chain head
+    IF NEW.prev_hash IS NOT NULL AND btrim(NEW.prev_hash) <> '' AND NEW.prev_hash <> v_last_hash THEN
+        RAISE EXCEPTION 'COMPLIANCE VIOLATION: Invalid prev_hash in task_events_audit INSERT.'
+            USING ERRCODE = '23514';
+    END IF;
+
     NEW.prev_hash := v_last_hash;
 
-    -- Canonical pipe-delimited string over all immutable compliance fields
+    -- Canonical pipe-delimited string over all immutable compliance fields (ID-008 parity)
     v_canonical_string := concat_ws(
         '|',
         COALESCE(NEW.event_id::text, ''),
@@ -183,12 +222,20 @@ BEGIN
         COALESCE(NEW.actor_slack_id, ''),
         COALESCE(NEW.actor_entra_oid, ''),
         COALESCE(NEW.actor_role, ''),
-        COALESCE(NEW.payload::text, '{}'),
+        fn_canonical_jsonb(COALESCE(NEW.payload, '{}'::jsonb)),
         to_char(NEW.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
         NEW.prev_hash
     );
 
-    NEW.row_hash := encode(digest(v_canonical_string, 'sha256'), 'hex');
+    v_computed_hash := encode(public.digest(convert_to(v_canonical_string, 'UTF8'), 'sha256'), 'hex');
+
+    -- ID-010: Reject forged row_hash if caller supplied one that does not match the DB-computed SHA-256
+    IF NEW.row_hash IS NOT NULL AND btrim(NEW.row_hash) <> '' AND NEW.row_hash <> v_computed_hash THEN
+        RAISE EXCEPTION 'COMPLIANCE VIOLATION: Forged or mismatched row_hash in task_events_audit INSERT.'
+            USING ERRCODE = '23514';
+    END IF;
+
+    NEW.row_hash := v_computed_hash;
     RETURN NEW;
 END;
 $$;

@@ -1,15 +1,17 @@
 """
-Phase 1 Critic Verification Gate:
-Tests Database Schema, 33-Task Normalization, RBAC Constraints,
-Append-Only Immutability Triggers, and SHA-256 Cryptographic Hash Chain Tamper Detection.
+Phase 1 Critic Verification Gate (PostgreSQL-Exclusive):
+Tests PostgreSQL Schema (`db/01_schema.sql`), 33-Task SQL Seeding (`db/02_seed_tasks.sql`),
+RBAC Constraints, Append-Only Immutability Triggers, and SHA-256 Cryptographic Hash Chain Tamper Detection.
+Zero SQLite usage anywhere in this suite.
 """
 
 from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-import sqlite3
 import unittest
+
+import psycopg
 
 from src.domain.models import (
     DailyWindow,
@@ -23,7 +25,7 @@ from src.repository.db_repo import ComplianceRepository
 
 class Phase1CriticTestSuite(unittest.TestCase):
     def test_all_33_tasks_seeded_and_normalized_accurately(self) -> None:
-        repo = ComplianceRepository(":memory:")
+        repo = ComplianceRepository()
         count = repo.seed_tasks_from_sql_file()
         self.assertEqual(count, 33)
 
@@ -55,14 +57,14 @@ class Phase1CriticTestSuite(unittest.TestCase):
         self.assertEqual(normalize_role_label("Dispenser"), RoleRequirement.DISPENSER)
 
         # Verify only Fridge Check requires structured input
-        structured = [r for r in rows if r["requires_structured_input"] == 1]
+        structured = [r for r in rows if bool(r["requires_structured_input"]) is True]
         self.assertEqual(len(structured), 1)
         self.assertEqual(structured[0]["task_name"], "Fridge Check (Min/Max/Current)")
         repo.close()
 
     def test_pharmacist_requires_gphc_registration_number(self) -> None:
-        repo = ComplianceRepository(":memory:")
-        with self.assertRaises(sqlite3.IntegrityError):
+        repo = ComplianceRepository()
+        with self.assertRaises(psycopg.Error):
             repo.upsert_user(
                 entra_oid="oid-pharm-invalid",
                 slack_user_id="U_PHARM_BAD",
@@ -84,30 +86,32 @@ class Phase1CriticTestSuite(unittest.TestCase):
         repo.close()
 
     def test_audit_ledger_blocks_sql_update_and_delete_at_db_trigger_level(self) -> None:
-        repo = ComplianceRepository(":memory:")
+        repo = ComplianceRepository()
         repo.seed_tasks_from_sql_file()
         repo.ensure_instances_for_date(date(2026, 10, 13))
 
         events = repo.get_all_audit_events()
         self.assertEqual(len(events), 33)
 
-        # Critic Attack 1: Attempt direct SQL UPDATE on task_events_audit
+        # Critic Attack 1: Attempt direct SQL UPDATE on PostgreSQL task_events_audit
         with self.assertRaisesRegex(
-            sqlite3.IntegrityError,
+            psycopg.Error,
             "COMPLIANCE VIOLATION: task_events_audit is strictly append-only",
         ):
-            repo.conn.execute("UPDATE task_events_audit SET actor_role = 'Pharm' WHERE audit_seq = 1")
+            with repo.conn.transaction():
+                repo.conn.execute("UPDATE task_events_audit SET actor_role = 'Pharm' WHERE audit_seq = 1")
 
-        # Critic Attack 2: Attempt direct SQL DELETE on task_events_audit
+        # Critic Attack 2: Attempt direct SQL DELETE on PostgreSQL task_events_audit
         with self.assertRaisesRegex(
-            sqlite3.IntegrityError,
+            psycopg.Error,
             "COMPLIANCE VIOLATION: task_events_audit is strictly append-only",
         ):
-            repo.conn.execute("DELETE FROM task_events_audit WHERE audit_seq = 1")
+            with repo.conn.transaction():
+                repo.conn.execute("DELETE FROM task_events_audit WHERE audit_seq = 1")
         repo.close()
 
     def test_sha256_hash_chain_detects_storage_level_tampering(self) -> None:
-        repo = ComplianceRepository(":memory:")
+        repo = ComplianceRepository()
         repo.seed_tasks_from_sql_file()
         repo.ensure_instances_for_date(date(2026, 10, 13))
 
@@ -115,11 +119,12 @@ class Phase1CriticTestSuite(unittest.TestCase):
         self.assertTrue(verification.is_valid)
         self.assertEqual(verification.total_rows_checked, 33)
 
-        # Critic Attack 3: Simulate a rogue cloud admin dropping the trigger, altering a historical timestamp
-        repo.conn.execute("DROP TRIGGER trg_prevent_audit_update;")
-        repo.conn.execute(
-            "UPDATE task_events_audit SET occurred_at = '2026-10-13T08:00:00.000000Z' WHERE audit_seq = 10"
-        )
+        # Critic Attack 3: Simulate a rogue cloud superuser dropping the PostgreSQL trigger and altering a timestamp
+        with repo.conn.transaction():
+            repo.conn.execute("DROP TRIGGER trg_prevent_audit_row_mutation ON task_events_audit;")
+            repo.conn.execute(
+                "UPDATE task_events_audit SET occurred_at = '2026-10-13T08:00:00.000000Z' WHERE audit_seq = 10"
+            )
 
         tampered_check = repo.verify_ledger_integrity()
         self.assertFalse(tampered_check.is_valid)

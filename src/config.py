@@ -20,15 +20,15 @@ class AppConfig:
     # Execution environment ("development" vs "production")
     environment: str = field(default_factory=lambda: os.getenv("ENV", "development").lower())
 
-    # Database (Azure PostgreSQL Flexible Server in production)
+    # Database (Azure PostgreSQL Flexible Server in production; PostgreSQL test DB in local dev/test)
     database_url: str = field(
         default_factory=lambda: os.getenv(
             "DATABASE_URL",
-            "postgresql://app_compliance_writer:changeme@localhost:5432/pharmacy_compliance?sslmode=require",
+            os.getenv(
+                "TEST_DATABASE_URL",
+                "postgresql://postgres:postgres@localhost:5432/pharmacy_compliance_test",
+            ),
         )
-    )
-    sqlite_fallback_path: str = field(
-        default_factory=lambda: os.getenv("SQLITE_FALLBACK_PATH", "pharmacy_compliance_local.db")
     )
 
     # Slack (Socket Mode - Free Tier compatible)
@@ -74,7 +74,11 @@ class AppConfig:
 
     def validate_production_secrets(self) -> None:
         """ID-005: Fail fast if required secrets are missing or use known placeholders."""
-        if not self.database_url or "changeme" in self.database_url:
+        if (
+            not self.database_url
+            or "changeme" in self.database_url
+            or "postgres:postgres@localhost" in self.database_url
+        ):
             raise RuntimeError("ID-005 Violation: DATABASE_URL is missing or contains default password.")
         if not self.slack_bot_token or self.slack_bot_token in FORBIDDEN_PLACEHOLDERS:
             raise RuntimeError("ID-005 Violation: SLACK_BOT_TOKEN is missing or placeholder.")
