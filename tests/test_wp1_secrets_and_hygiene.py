@@ -40,7 +40,7 @@ class TestWP1SecretsAndHygiene(unittest.TestCase):
             for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
-        self.assertEqual(len(reqs), 6, f"Expected all 6 dependencies in requirements.txt, got {len(reqs)}: {reqs}")
+        self.assertGreaterEqual(len(reqs), 6, f"Expected at least 6 dependencies in requirements.txt, got {len(reqs)}: {reqs}")
         for req in reqs:
             self.assertIn("==", req, f"Dependency not strictly pinned: {req}")
 

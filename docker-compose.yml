@@ -11,15 +11,15 @@ services:
     volumes:
       - compliance_data:/app/data
 
-  # 2. Entra ID Compliance & GPhC Inspection Dashboard (Streamlit UI)
+  # 2. Entra ID Compliance & GPhC Inspection Dashboard (Streamlit UI — ID-007: bound to 127.0.0.1 for reverse-proxy TLS termination)
   compliance-dashboard:
     build: .
     container_name: pharmacy_compliance_dashboard
     restart: unless-stopped
     env_file: .env
     ports:
-      - "8501:8501"
-    command: streamlit run src/dashboard/app.py --server.port=8501 --server.address=0.0.0.0
+      - "127.0.0.1:8501:8501"
+    command: streamlit run src/dashboard/app.py --server.port=8501 --server.address=0.0.0.0 --server.enableCORS=true --server.enableXsrfProtection=true
     volumes:
       - compliance_data:/app/data
 

@@ -23,7 +23,9 @@ class DailyWindow(str, Enum):
 
 class StaffRole(str, Enum):
     PHARM = "Pharm"
+    PHARM_TECH = "PT"
     DISPENSER = "Dispenser"
+    MCA = "MCA"
     MANAGER = "Manager"
 
 
@@ -71,17 +73,34 @@ def normalize_role_label(raw_label: str) -> RoleRequirement:
 
 def is_role_authorized(user_role: StaffRole, required_role: RoleRequirement) -> bool:
     """
-    Determines whether a user with `user_role` is permitted to complete a task requiring `required_role`.
+    ID-011: Determines whether a user with `user_role` is permitted to complete a task requiring `required_role`.
+    Per GPhC regulatory requirements:
     - RoleRequirement.PHARM: Strictly requires a Pharmacist ('Pharm').
-      Dispensers and non-pharmacist Managers cannot sign off RP/Pharmacist-only tasks.
-    - RoleRequirement.DISPENSER: Can be completed by a Dispenser OR a Pharmacist covering dispensary duties.
-    - RoleRequirement.EITHER: Can be completed by either a Pharmacist or a Dispenser.
+    - RoleRequirement.DISPENSER: Can be completed by a Pharmacist ('Pharm'), Pharmacy Technician ('PT'),
+      or Dispenser / Dispensing Assistant ('Dispenser').
+    - RoleRequirement.EITHER: Can be completed by 'Pharm', 'PT', 'Dispenser', or 'MCA' (Medicines Counter Assistant).
+    - StaffRole.MANAGER: Non-qualified management role has ZERO authority to complete clinical/pharmacy tasks
+      (managers only hold read-only oversight of rota/ledger completion unless mapped to a qualified GPhC role).
     """
+    if user_role == StaffRole.MANAGER:
+        return False
     if required_role == RoleRequirement.PHARM:
         return user_role == StaffRole.PHARM
-    if required_role in (RoleRequirement.DISPENSER, RoleRequirement.EITHER):
-        return user_role in (StaffRole.PHARM, StaffRole.DISPENSER)
+    if required_role == RoleRequirement.DISPENSER:
+        return user_role in (StaffRole.PHARM, StaffRole.PHARM_TECH, StaffRole.DISPENSER)
+    if required_role == RoleRequirement.EITHER:
+        return user_role in (StaffRole.PHARM, StaffRole.PHARM_TECH, StaffRole.DISPENSER, StaffRole.MCA)
     return False
+
+
+def can_complete_clinical_tasks(user_role: StaffRole) -> bool:
+    """Returns True only for qualified pharmacy roles ('Pharm', 'PT', 'Dispenser', 'MCA'), never 'Manager'."""
+    return user_role in (StaffRole.PHARM, StaffRole.PHARM_TECH, StaffRole.DISPENSER, StaffRole.MCA)
+
+
+def can_view_audit_and_rota_oversight(user_role: StaffRole) -> bool:
+    """ID-028: Restricts forensic audit trail & rota oversight tab to Pharmacist and Manager roles."""
+    return user_role in (StaffRole.PHARM, StaffRole.MANAGER)
 
 
 @dataclass(frozen=True)

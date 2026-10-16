@@ -23,7 +23,7 @@ BEGIN
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'staff_role' AND n.nspname = current_schema()) THEN
-        CREATE TYPE staff_role AS ENUM ('Pharm', 'Dispenser', 'Manager');
+        CREATE TYPE staff_role AS ENUM ('Pharm', 'PT', 'Dispenser', 'MCA', 'Manager');
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'role_requirement' AND n.nspname = current_schema()) THEN

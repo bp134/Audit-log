@@ -573,6 +573,8 @@ class ComplianceRepository:
             if instance.requires_structured_input
             else AuditEventType.TASK_COMPLETED
         )
+        # ID-012: Minimize PII in audit payloads — do not duplicate GPhC registration numbers,
+        # full names, or emails inside the JSON payload (actor_user_id and actor_entra_oid link to RBAC).
         self.append_audit_event(
             event_type=audit_type,
             task_id=instance.task_id,
@@ -584,7 +586,6 @@ class ComplianceRepository:
                 "frequency": instance.frequency.value,
                 "structured_data": structured_payload,
                 "notes": notes or "",
-                "gphc_reg_number": actor.gphc_reg_number,
             },
             occurred_at=ts,
         )
