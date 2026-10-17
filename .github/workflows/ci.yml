@@ -42,8 +42,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install postgresql-client (pg_dump)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Install postgresql-client-18 (pg_dump 18 matching PostgreSQL 18 server)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-18
+          sudo ln -sf /usr/lib/postgresql/18/bin/pg_dump /usr/local/bin/pg_dump
+          pg_dump --version
 
       - name: Install pinned application dependencies and security gates
         run: |
