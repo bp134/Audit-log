@@ -1,0 +1,21 @@
+title = "Pharmacy Compliance Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist SHA-256 audit evidence packets, git diff patches, dummy test tokens, and config attribute references"
+paths = [
+  '''^WP[1-6]/.*''',
+  '''^fixtures/.*\.patch$''',
+  '''^pipeline_audit_trail\.jsonl$''',
+  '''^narrative_log\.jsonl$''',
+  '''^tests/test_.*\.py$''',
+]
+regexes = [
+  '''0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef''',
+  '''s3_secret_key=cfg\.hetzner_s3_secret_key''',
+  '''slack-signing-placeholder''',
+  '''xoxb-placeholder''',
+  '''xapp-placeholder''',
+]
